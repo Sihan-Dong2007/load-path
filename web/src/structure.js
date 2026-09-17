@@ -1,7 +1,7 @@
-import { assembleGlobalStiffness } from "./assemble.js";
+import { assembleSparseStiffness, sparseMatVec } from "./sparse.js";
 import { numDofs } from "./mesh.js";
-import { reduceSystem, expandSolution } from "./boundary.js";
-import { solveLinearSystem } from "./linalg.js";
+import { freeDofList, restrictMatVec, expandSolution } from "./boundary.js";
+import { conjugateGradient } from "./cg.js";
 
 // Solves for the displacement of every node under the given loads.
 //
@@ -10,8 +10,13 @@ import { solveLinearSystem } from "./linalg.js";
 //
 // Returns the full displacement vector (length numDofs(numElemX, numElemY)),
 // indexed the same way as the DOFs everywhere else in this project.
+//
+// Uses the sparse matrix + conjugate gradient, not the dense Gaussian
+// elimination solver in linalg.js — that one is kept around for tests and
+// small cross-checks, but doesn't scale to the mesh sizes this needs to
+// run at.
 export function solveDisplacement(numElemX, numElemY, densities, fixedDofs, loads) {
-  const K = assembleGlobalStiffness(numElemX, numElemY, densities);
+  const K = assembleSparseStiffness(numElemX, numElemY, densities);
   const n = numDofs(numElemX, numElemY);
 
   const f = new Array(n).fill(0);
@@ -19,7 +24,10 @@ export function solveDisplacement(numElemX, numElemY, densities, fixedDofs, load
     f[dof] = value;
   }
 
-  const { Kff, ff, freeDofs } = reduceSystem(K, f, fixedDofs);
-  const uFree = solveLinearSystem(Kff, ff);
+  const freeDofs = freeDofList(n, fixedDofs);
+  const ff = freeDofs.map((dof) => f[dof]);
+  const matVecFree = restrictMatVec((v) => sparseMatVec(K, v), freeDofs, n);
+
+  const { x: uFree } = conjugateGradient(matVecFree, ff);
   return expandSolution(uFree, freeDofs, n);
 }
