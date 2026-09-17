@@ -51,7 +51,13 @@ runAndAnimate(nodeDofs(defaultTopCenter)[1]);
 const handle = document.getElementById("load-handle");
 
 // Converts a point in page coordinates to the vertical-displacement DOF of
-// the nearest node, or null if the point isn't over the canvas at all.
+// the nearest node along the TOP edge, or null if the point isn't over the
+// canvas at all. Only the horizontal position is used — a dropped weight
+// always rests on top of the structure, never inside it. That's both more
+// physically sensible (a load embedded inside the material rather than
+// resting on its surface isn't a scenario this represents) and sidesteps a
+// real FEM artifact: a point load on an interior node is a stress
+// singularity, which showed up as a visible kink in testing.
 function clientPointToLoadDof(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   const relX = (clientX - rect.left) / rect.width;
@@ -59,11 +65,8 @@ function clientPointToLoadDof(clientX, clientY) {
   if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return null;
 
   const col = Math.round(relX * numElemX);
-  // Canvas y grows downward; row 0 is the bottom of the domain (this
-  // project's y-up convention), so flip.
-  const row = Math.round((1 - relY) * numElemY);
+  const node = nodeId(col, numElemY, numElemX); // numElemY = the top row
 
-  const node = nodeId(col, row, numElemX);
   return nodeDofs(node)[1]; // the vertical DOF — a dropped weight pulls straight down
 }
 
