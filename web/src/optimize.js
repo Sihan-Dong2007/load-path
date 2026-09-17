@@ -14,12 +14,14 @@ function computeCompliance(loads, u) {
   return loads.reduce((sum, [dof, value]) => sum + value * u[dof], 0);
 }
 
-// The full topology-optimization loop: solve for displacement under the
-// current material distribution, work out which elements matter
-// (sensitivity), smooth that out (filter), and shift material toward the
-// elements that matter most (OC update) — repeating until the design stops
-// changing much, or a safety cap on iterations is hit.
-export function runTopologyOptimization(numElemX, numElemY, fixedDofs, loads, options = {}) {
+// The full topology-optimization loop, one iteration per yield: solve for
+// displacement under the current material distribution, work out which
+// elements matter (sensitivity), smooth that out (filter), and shift
+// material toward the elements that matter most (OC update). Exposed as a
+// generator — rather than a function that just returns the final result —
+// so a renderer can draw every intermediate step (watching the structure
+// take shape) instead of only ever seeing the converged end state.
+export function* iterateTopologyOptimization(numElemX, numElemY, fixedDofs, loads, options = {}) {
   const {
     volumeFraction = 0.5,
     rmin = 1.5,
@@ -30,7 +32,6 @@ export function runTopologyOptimization(numElemX, numElemY, fixedDofs, loads, op
 
   let densities = Array.from({ length: numElemY }, () => new Array(numElemX).fill(volumeFraction));
   let previousU;
-  const history = [];
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     const u = solveDisplacement(numElemX, numElemY, densities, fixedDofs, loads, { previousU });
@@ -47,13 +48,30 @@ export function runTopologyOptimization(numElemX, numElemY, fixedDofs, loads, op
       }
     }
 
-    history.push({ iteration: iteration + 1, compliance, maxChange });
     densities = newDensities;
+    const converged = maxChange < tolerance;
+    yield { densities, iteration: iteration + 1, compliance, maxChange, converged };
 
-    if (maxChange < tolerance) {
-      return { densities, iterations: iteration + 1, converged: true, history };
-    }
+    if (converged) return;
+  }
+}
+
+// Drains iterateTopologyOptimization synchronously and returns just the
+// final result — what tests and the Node demo script want, when nothing is
+// watching the intermediate frames.
+export function runTopologyOptimization(numElemX, numElemY, fixedDofs, loads, options = {}) {
+  const history = [];
+  let last;
+
+  for (const step of iterateTopologyOptimization(numElemX, numElemY, fixedDofs, loads, options)) {
+    history.push({ iteration: step.iteration, compliance: step.compliance, maxChange: step.maxChange });
+    last = step;
   }
 
-  return { densities, iterations: maxIterations, converged: false, history };
+  return {
+    densities: last.densities,
+    iterations: last.iteration,
+    converged: last.converged,
+    history,
+  };
 }
