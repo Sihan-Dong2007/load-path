@@ -10,7 +10,8 @@
 import assert from "node:assert/strict";
 import { getElementStiffnessMatrix, matVec } from "./web/src/fem.js";
 import { assembleGlobalStiffness, solidDensities } from "./web/src/assemble.js";
-import { numDofs } from "./web/src/mesh.js";
+import { numDofs, nodeId, nodeDofs } from "./web/src/mesh.js";
+import { solveDisplacement } from "./web/src/structure.js";
 
 const EPSILON = 1e-9;
 
@@ -76,5 +77,58 @@ function assertMeshIsPhysicallySound(numElemX, numElemY) {
 assertMeshIsPhysicallySound(1, 1);
 assertMeshIsPhysicallySound(3, 2);
 console.log("✓ assembled meshes (1x1 and 3x2) are symmetric with zero rigid-body force");
+
+// 5. Solve an actual structure: a mesh pinned at its bottom-left and
+// bottom-right corners (like two piers), loaded straight down at the
+// top-center node (like a weight dropped in the middle of a bridge deck).
+// Because the geometry, supports and load are all left-right symmetric, the
+// resulting displacement field is physically required to be symmetric too —
+// mirrored nodes must move the same amount vertically and opposite amounts
+// horizontally. That's a strong end-to-end check on assembly, boundary
+// conditions and the solver all at once.
+{
+  const numElemX = 4;
+  const numElemY = 2;
+  const densities = solidDensities(numElemX, numElemY);
+
+  const bottomLeft = nodeId(0, 0, numElemX);
+  const bottomRight = nodeId(numElemX, 0, numElemX);
+  const fixedDofs = [...nodeDofs(bottomLeft), ...nodeDofs(bottomRight)];
+
+  const topCenter = nodeId(numElemX / 2, numElemY, numElemX);
+  const [, topCenterY] = nodeDofs(topCenter);
+  const loads = [[topCenterY, -1]];
+
+  const u = solveDisplacement(numElemX, numElemY, densities, fixedDofs, loads);
+
+  u.forEach((value, i) => {
+    assert.ok(Number.isFinite(value), `u[${i}] should be finite, got ${value}`);
+  });
+  console.log("✓ solved displacement field has no NaN/Infinity");
+
+  assert.ok(u[topCenterY] < 0, "the loaded node should move down (negative y)");
+  console.log("✓ the loaded node moves in the direction of the load");
+
+  const MIRROR_EPSILON = 1e-6;
+  for (let row = 0; row <= numElemY; row++) {
+    for (let col = 0; col <= numElemX; col++) {
+      const mirrorCol = numElemX - col;
+      const node = nodeId(col, row, numElemX);
+      const mirrorNode = nodeId(mirrorCol, row, numElemX);
+      const [ux, uy] = nodeDofs(node).map((d) => u[d]);
+      const [mux, muy] = nodeDofs(mirrorNode).map((d) => u[d]);
+
+      assert.ok(
+        Math.abs(uy - muy) < MIRROR_EPSILON,
+        `node(${col},${row}) uy=${uy} should match mirror node(${mirrorCol},${row}) uy=${muy}`
+      );
+      assert.ok(
+        Math.abs(ux + mux) < MIRROR_EPSILON,
+        `node(${col},${row}) ux=${ux} should be -1x mirror node(${mirrorCol},${row}) ux=${mux}`
+      );
+    }
+  }
+  console.log("✓ the displacement field is left-right symmetric, as the setup requires");
+}
 
 console.log("\nAll checks passed.");
