@@ -37,7 +37,8 @@ export function getElementStiffnessMatrix(E = 1, nu = 0.3) {
   return rows.map((row) => row.map((idx) => scale * k[idx]));
 }
 
-// Multiplies an 8x8 matrix by an 8-vector.
-export function matVec8(matrix, vector) {
+// Multiplies a square matrix by a vector. Works for the 8x8 element matrix
+// and for full assembled global matrices alike.
+export function matVec(matrix, vector) {
   return matrix.map((row) => row.reduce((sum, value, j) => sum + value * vector[j], 0));
 }
