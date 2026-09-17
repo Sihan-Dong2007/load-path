@@ -15,6 +15,7 @@ import { solveDisplacement } from "./web/src/structure.js";
 import { computeSensitivities } from "./web/src/sensitivity.js";
 import { filterSensitivities } from "./web/src/filter.js";
 import { updateDensities } from "./web/src/oc.js";
+import { assembleSparseStiffness, sparseMatVec } from "./web/src/sparse.js";
 
 const EPSILON = 1e-9;
 
@@ -261,5 +262,51 @@ console.log("✓ assembled meshes (1x1 and 3x2) are symmetric with zero rigid-bo
   );
   console.log("✓ a skewed sensitivity field shifts material toward the more important elements, near the target volume");
 }
+
+// 9. Sparse assembly should be a pure storage change, not a math change:
+// for the same densities, it must match dense assembly entry-for-entry,
+// and it must pass the exact same rigid-body physical check as the dense
+// version.
+function sparseToDense(K, n) {
+  return K.map((row) => {
+    const dense = new Array(n).fill(0);
+    for (const [col, value] of row) dense[col] = value;
+    return dense;
+  });
+}
+
+function assertSparseMatchesDense(numElemX, numElemY) {
+  const densities = solidDensities(numElemX, numElemY);
+  const dense = assembleGlobalStiffness(numElemX, numElemY, densities);
+  const sparse = assembleSparseStiffness(numElemX, numElemY, densities);
+  const n = numDofs(numElemX, numElemY);
+  const sparseDense = sparseToDense(sparse, n);
+
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      assert.ok(
+        Math.abs(dense[i][j] - sparseDense[i][j]) < EPSILON,
+        `sparse/dense mismatch at [${i}][${j}]: dense=${dense[i][j]} sparse=${sparseDense[i][j]}`
+      );
+    }
+  }
+}
+
+assertSparseMatchesDense(1, 1);
+assertSparseMatchesDense(3, 2);
+console.log("✓ sparse assembly matches dense assembly exactly");
+
+function assertSparseIsPhysicallySound(numElemX, numElemY) {
+  const K = assembleSparseStiffness(numElemX, numElemY, solidDensities(numElemX, numElemY));
+  const n = numDofs(numElemX, numElemY);
+  const translateXAll = Array.from({ length: n }, (_, i) => (i % 2 === 0 ? 1 : 0));
+  assertApproxZero(sparseMatVec(K, translateXAll), `sparse K(${numElemX}x${numElemY}) * translateXAll`);
+  const translateYAll = Array.from({ length: n }, (_, i) => (i % 2 === 1 ? 1 : 0));
+  assertApproxZero(sparseMatVec(K, translateYAll), `sparse K(${numElemX}x${numElemY}) * translateYAll`);
+}
+
+assertSparseIsPhysicallySound(1, 1);
+assertSparseIsPhysicallySound(3, 2);
+console.log("✓ sparse assembly passes the same rigid-body check as dense");
 
 console.log("\nAll checks passed.");
