@@ -1,7 +1,7 @@
 import { nodeId, nodeDofs } from "./mesh.js";
 import { runTopologyOptimization } from "./optimize.js";
 
-const { Engine, Render, Runner, Bodies, Body, Composite, Constraint, Events, Vector } = window.Matter;
+const { Engine, Render, Runner, Bodies, Body, Composite, Events, Vector } = window.Matter;
 
 // Reuse the same scenario as demo.js — real optimizer output, not a
 // hand-drawn fake structure.
@@ -50,15 +50,22 @@ function closestCell(cells, targetElx, targetEly) {
 }
 
 // This converged shape is two diagonal struts meeting at the top-center
-// load point — a triangle. First attempt modeled every grid cell as its
-// own body welded into a ~48-part Matter.js compound; that produced wildly
-// wrong part positions and exploding angular velocities that never got
-// fully explained — a real limitation hit while building this, not
-// something to paper over. Simplifying to ONE plain rectangle per side
-// (its two ends placed exactly at the real support and apex positions,
-// rotated to match) sidesteps whatever was going wrong with compound
-// bodies entirely, and is physically equivalent for this purpose: each
-// side is a single rigid beam either way.
+// load point — a triangle. Each side is one rigid beam (a single rotated
+// rectangle).
+//
+// Earlier versions tried to hold the beams up with Matter.js constraints
+// (a single pin per foot, then two points per foot for a rigid weld) and
+// kept hitting the same wall: any pin that lets a beam rotate makes
+// "apex up" merely an UNSTABLE equilibrium (like a pencil on its tip),
+// which the normal first-frame solver settling was enough to tip over;
+// welding it down instead over-constrained the system and made the
+// solver unstable outright. Both are real, documented problems with
+// iterative constraint solvers, not something worth continuing to fight.
+//
+// The fix: don't use a constraint at all. Build each beam as isStatic —
+// truly, unconditionally fixed in place, no settling, no equilibrium to
+// tip over — and only make it dynamic (so it starts falling under
+// gravity) at the moment a hard enough impact says it should.
 function buildHalf(columnFilter, supportElx) {
   const cells = [];
   for (let ely = 0; ely < numElemY; ely++) {
@@ -78,101 +85,24 @@ function buildHalf(columnFilter, supportElx) {
   const centerX = (bottomCell.x + topCell.x) / 2;
   const centerY = (bottomCell.y + topCell.y) / 2;
 
-  const body = Bodies.rectangle(centerX, centerY, length, cellSize * 1.4);
+  // A bit longer than the true support-to-apex distance so the two
+  // beams' tips overlap at the top, giving a dropped weight a solid
+  // surface to land on.
+  // High friction so a dropped weight settles where it lands instead of
+  // sliding down the slope and hitting things again — which caused
+  // several small, harmless-looking collisions to add up to a break that
+  // the first impact alone didn't cause.
+  const body = Bodies.rectangle(centerX, centerY, length + cellSize, cellSize * 1.4, { friction: 0.9 });
   Body.setAngle(body, angle);
-  // The two beams touch near the apex; without this Matter.js's normal
-  // collision response would push them apart right where the tie is
-  // trying to hold them together.
-  body.collisionFilter.group = -1;
+  Body.setStatic(body, true);
   Composite.add(world, body);
 
-  const halfLength = length / 2;
-  return {
-    body,
-    supportWorld: bottomCell,
-    apexWorld: topCell,
-    bottomOffset: { x: -halfLength, y: 0 }, // local, unrotated — Matter.js rotates this by body.angle itself
-    topOffset: { x: halfLength, y: 0 },
-  };
+  return { body };
 }
 
 const midColumn = numElemX / 2;
 const left = buildHalf((elx) => elx <= midColumn, 0);
 const right = buildHalf((elx) => elx > midColumn, numElemX);
-
-// Pin each beam's foot to a fixed point in space — a real support, but one
-// that (like a real pinned support) still lets the beam rotate around it.
-function pinToGround(half) {
-  Composite.add(
-    world,
-    Constraint.create({
-      bodyA: half.body,
-      pointA: half.bottomOffset,
-      pointB: half.supportWorld,
-      length: 0,
-      stiffness: 1,
-    })
-  );
-}
-pinToGround(left);
-pinToGround(right);
-
-function worldPoint(half, offset) {
-  return Vector.add(half.body.position, Vector.rotate(offset, half.body.angle));
-}
-
-// The breakable joint: a single tie between the beams' top ends. Two
-// ground pins (4 DOF removed) + one apex tie (2 DOF removed) = 6, exactly
-// matching the 6 DOF of two 2D rigid bodies — a perfectly-determined rigid
-// triangle, not over- or under-constrained. An earlier version used two
-// ties at the apex to try to resist relative rotation too, but that
-// over-constrained the system (8 DOF worth of constraints on 6 DOF) and
-// made the solver unstable — it blew up within the very first step even
-// with a clean, verified-correct initial state. One tie is both simpler
-// and the numerically well-behaved choice.
-function makeTie(offsetName) {
-  const a = worldPoint(left, left[offsetName]);
-  const b = worldPoint(right, right[offsetName]);
-  return Constraint.create({
-    bodyA: left.body,
-    pointA: left[offsetName],
-    bodyB: right.body,
-    pointB: right[offsetName],
-    length: Vector.magnitude(Vector.sub(b, a)),
-    stiffness: 1,
-  });
-}
-
-const apexTies = [makeTie("topOffset")];
-Composite.add(world, apexTies);
-
-// Any freshly-built rigid joint takes the solver a few frames to settle
-// into equilibrium — gravity is applied all at once, and correcting the
-// resulting constraint violation happens gradually over several
-// iterations of the *simulation*, not within one frame. A first-frame
-// strain spike (measured over 200x rest length in testing, settling to
-// under 5% within ~15 frames) is normal solver behavior, not a sign of
-// overload — checking for breaks before that settling finishes broke the
-// joint on frame 0 every time, before the structure ever got a chance to
-// prove it could hold on its own.
-const SETTLE_FRAMES = 40;
-const BREAK_STRAIN = 0.3;
-let frameCount = 0;
-Events.on(engine, "afterUpdate", () => {
-  frameCount++;
-  for (const tie of apexTies) {
-    if (tie.broken) continue;
-    if (frameCount <= SETTLE_FRAMES) continue;
-    const a = worldPoint(left, tie.pointA);
-    const b = worldPoint(right, tie.pointB);
-    const currentLength = Vector.magnitude(Vector.sub(b, a));
-    const strain = Math.abs(currentLength - tie.length) / cellSize;
-    if (strain > BREAK_STRAIN) {
-      Composite.remove(world, tie);
-      tie.broken = true;
-    }
-  }
-});
 
 // Ground + walls so debris settles instead of falling forever.
 const ground = Bodies.rectangle(canvasWidth / 2, canvasHeight - 10, canvasWidth, 20, { isStatic: true });
@@ -182,8 +112,26 @@ Composite.add(world, [ground, leftWall, rightWall]);
 
 // The test weight, dropped from above the same load point used to
 // generate the structure.
-const testBall = Bodies.circle(physicsX(midColumn), 20, 18, { density: 1, restitution: 0.1 });
+const testBall = Bodies.circle(physicsX(midColumn), 20, 18, { density: 0.05, friction: 0.9, restitution: 0.1 });
 Composite.add(world, testBall);
+
+// Breaking is now a collision question, not a constraint-strain question:
+// on impact, momentum (mass x speed) standing in for how hard the ball
+// hit. Above BREAK_MOMENTUM, whichever beam(s) it hit stop being static
+// and start falling like any other dynamic body from that point on.
+const BREAK_MOMENTUM = 60;
+Events.on(engine, "collisionStart", (event) => {
+  for (const pair of event.pairs) {
+    const beam = [pair.bodyA, pair.bodyB].find((b) => (b === left.body || b === right.body) && b.isStatic);
+    const ball = [pair.bodyA, pair.bodyB].find((b) => b === testBall);
+    if (!beam || !ball) continue;
+
+    const momentum = ball.mass * Vector.magnitude(ball.velocity);
+    if (momentum > BREAK_MOMENTUM) {
+      Body.setStatic(beam, false);
+    }
+  }
+});
 
 const render = Render.create({
   element: document.body,
@@ -194,4 +142,4 @@ const runner = Runner.create();
 Render.run(render);
 Runner.run(runner, engine);
 
-window.__debug = { engine, render, runner, testBall, apexTies, left, right, world, worldPoint };
+window.__debug = { engine, render, runner, testBall, left, right, world };
