@@ -29,6 +29,14 @@ export function assembleSparseStiffness(numElemX, numElemY, densities, penal = 3
   return K;
 }
 
+// The diagonal of a sparse matrix — used to build a Jacobi preconditioner
+// for CG (approximating A^-1 with 1/diagonal is cheap and, for a stiffness
+// matrix like this one, a meaningfully better guess than no preconditioner
+// at all).
+export function sparseDiagonal(K) {
+  return K.map((row, i) => row.get(i) ?? 0);
+}
+
 // Multiplies a sparse matrix (array of Map<column, value> rows) by a dense
 // vector — only touches the nonzero entries, unlike matVec() in fem.js.
 export function sparseMatVec(K, vector) {

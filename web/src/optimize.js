@@ -29,10 +29,12 @@ export function runTopologyOptimization(numElemX, numElemY, fixedDofs, loads, op
   } = options;
 
   let densities = Array.from({ length: numElemY }, () => new Array(numElemX).fill(volumeFraction));
+  let previousU;
   const history = [];
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
-    const u = solveDisplacement(numElemX, numElemY, densities, fixedDofs, loads);
+    const u = solveDisplacement(numElemX, numElemY, densities, fixedDofs, loads, { previousU });
+    previousU = u;
     const compliance = computeCompliance(loads, u);
     const dc = computeSensitivities(numElemX, numElemY, densities, u);
     const dcFiltered = filterSensitivities(numElemX, numElemY, densities, dc, rmin);
