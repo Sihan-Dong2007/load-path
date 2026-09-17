@@ -19,6 +19,7 @@ import { assembleSparseStiffness, sparseMatVec } from "./web/src/sparse.js";
 import { conjugateGradient } from "./web/src/cg.js";
 import { reduceSystem } from "./web/src/boundary.js";
 import { solveLinearSystem } from "./web/src/linalg.js";
+import { runTopologyOptimization } from "./web/src/optimize.js";
 
 const EPSILON = 1e-9;
 
@@ -358,6 +359,35 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
     );
   });
   console.log(`✓ CG matches the dense solver on the actual bridge problem (${iterations} iterations)`);
+}
+
+// 12. The real correctness signal for the optimizer isn't "does the shape
+// look like a clean truss" — that depends on mesh resolution and volume
+// fraction, and can be misleading. It's whether compliance (what the
+// algorithm actually minimizes) decreases and settles, iteration over
+// iteration.
+{
+  const numElemX = 10;
+  const numElemY = 6;
+  const bottomLeft = nodeId(0, 0, numElemX);
+  const bottomRight = nodeId(numElemX, 0, numElemX);
+  const fixedDofs = [...nodeDofs(bottomLeft), ...nodeDofs(bottomRight)];
+  const topCenter = nodeId(numElemX / 2, numElemY, numElemX);
+  const [, topCenterY] = nodeDofs(topCenter);
+  const loads = [[topCenterY, -1]];
+
+  const { history } = runTopologyOptimization(numElemX, numElemY, fixedDofs, loads, { volumeFraction: 0.4 });
+
+  assert.ok(history.length > 1, "expected more than one iteration to check a trend");
+  for (let i = 1; i < history.length; i++) {
+    assert.ok(
+      history[i].compliance <= history[i - 1].compliance + 1e-6,
+      `compliance should not increase: iteration ${i + 1}=${history[i].compliance} vs iteration ${i}=${history[i - 1].compliance}`
+    );
+  }
+  console.log(
+    `✓ compliance decreases monotonically across ${history.length} iterations (${history[0].compliance.toFixed(4)} -> ${history[history.length - 1].compliance.toFixed(4)})`
+  );
 }
 
 console.log("\nAll checks passed.");

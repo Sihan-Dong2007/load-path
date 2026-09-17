@@ -5,8 +5,8 @@ import { nodeId, nodeDofs } from "./web/src/mesh.js";
 import { runTopologyOptimization } from "./web/src/optimize.js";
 import { densitiesToAscii } from "./web/src/visualize.js";
 
-const numElemX = 20;
-const numElemY = 10;
+const numElemX = Number(process.argv[2]) || 20;
+const numElemY = Number(process.argv[3]) || 10;
 
 const bottomLeft = nodeId(0, 0, numElemX);
 const bottomRight = nodeId(numElemX, 0, numElemX);
