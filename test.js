@@ -16,6 +16,9 @@ import { computeSensitivities } from "./web/src/sensitivity.js";
 import { filterSensitivities } from "./web/src/filter.js";
 import { updateDensities } from "./web/src/oc.js";
 import { assembleSparseStiffness, sparseMatVec } from "./web/src/sparse.js";
+import { conjugateGradient } from "./web/src/cg.js";
+import { reduceSystem } from "./web/src/boundary.js";
+import { solveLinearSystem } from "./web/src/linalg.js";
 
 const EPSILON = 1e-9;
 
@@ -308,5 +311,53 @@ function assertSparseIsPhysicallySound(numElemX, numElemY) {
 assertSparseIsPhysicallySound(1, 1);
 assertSparseIsPhysicallySound(3, 2);
 console.log("✓ sparse assembly passes the same rigid-body check as dense");
+
+// 10. CG on a tiny hand-checkable system: 4x+y=1, x+3y=2 solves to
+// x=1/11, y=7/11 (substitute the first equation into the second to check).
+{
+  const A = [
+    [4, 1],
+    [1, 3],
+  ];
+  const b = [1, 2];
+  const { x } = conjugateGradient((v) => matVec(A, v), b);
+
+  assert.ok(Math.abs(x[0] - 1 / 11) < 1e-6, `x[0]=${x[0]} should be ~${1 / 11}`);
+  assert.ok(Math.abs(x[1] - 7 / 11) < 1e-6, `x[1]=${x[1]} should be ~${7 / 11}`);
+  console.log("✓ CG matches the hand-solved answer for a tiny system");
+}
+
+// 11. CG must agree with the dense solver on an actual structural
+// problem — the same symmetric bridge setup from check 5 — not just on a
+// textbook toy example.
+{
+  const numElemX = 4;
+  const numElemY = 2;
+  const densities = solidDensities(numElemX, numElemY);
+
+  const bottomLeft = nodeId(0, 0, numElemX);
+  const bottomRight = nodeId(numElemX, 0, numElemX);
+  const fixedDofs = [...nodeDofs(bottomLeft), ...nodeDofs(bottomRight)];
+
+  const topCenter = nodeId(numElemX / 2, numElemY, numElemX);
+  const [, topCenterY] = nodeDofs(topCenter);
+  const n = numDofs(numElemX, numElemY);
+  const f = new Array(n).fill(0);
+  f[topCenterY] = -1;
+
+  const K = assembleGlobalStiffness(numElemX, numElemY, densities);
+  const { Kff, ff } = reduceSystem(K, f, fixedDofs);
+
+  const denseSolution = solveLinearSystem(Kff, ff);
+  const { x: cgSolution, iterations } = conjugateGradient((v) => matVec(Kff, v), ff);
+
+  denseSolution.forEach((value, i) => {
+    assert.ok(
+      Math.abs(value - cgSolution[i]) < 1e-5,
+      `dense[${i}]=${value} should match CG[${i}]=${cgSolution[i]}`
+    );
+  });
+  console.log(`✓ CG matches the dense solver on the actual bridge problem (${iterations} iterations)`);
+}
 
 console.log("\nAll checks passed.");
