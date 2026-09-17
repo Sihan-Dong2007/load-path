@@ -20,6 +20,7 @@ import { conjugateGradient } from "./web/src/cg.js";
 import { reduceSystem } from "./web/src/boundary.js";
 import { solveLinearSystem } from "./web/src/linalg.js";
 import { runTopologyOptimization } from "./web/src/optimize.js";
+import { findConnectedPath } from "./web/src/connectivity.js";
 
 const EPSILON = 1e-9;
 
@@ -388,6 +389,47 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   console.log(
     `✓ compliance decreases monotonically across ${history.length} iterations (${history[0].compliance.toFixed(4)} -> ${history[history.length - 1].compliance.toFixed(4)})`
   );
+}
+
+// 13. Connectivity: a diagonal "staircase" that only touches at corners
+// (no shared edges) should still be found connected, since 8-connectivity
+// is what the collapse test needs — a real continuum FEM transmits force
+// through a shared corner node, not just a shared edge.
+{
+  const threshold = 0.5;
+  const staircase = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+  ];
+  const result = findConnectedPath(staircase, threshold, { elx: 0, ely: 0 }, { elx: 2, ely: 2 });
+  assert.ok(result !== null, "a corner-touching diagonal staircase should be found connected");
+  console.log("✓ a diagonal staircase (corner-touching only) is found connected");
+}
+
+// 14. Two solid cells with a real gap between them (not even diagonally
+// touching) must be reported as NOT connected.
+{
+  const threshold = 0.5;
+  const gapped = [
+    [1, 0, 0],
+    [0, 0, 0],
+    [0, 0, 1],
+  ];
+  const result = findConnectedPath(gapped, threshold, { elx: 0, ely: 0 }, { elx: 2, ely: 2 });
+  assert.strictEqual(result, null, "cells with a real gap between them should not be connected");
+  console.log("✓ a genuine gap is correctly reported as not connected");
+}
+
+// 15. minDensity must be the weakest cell actually on the path, not the
+// average — a chain's strength is set by its thinnest link.
+{
+  const threshold = 0.1;
+  const row = [[0.9, 0.3, 0.9]];
+  const result = findConnectedPath(row, threshold, { elx: 0, ely: 0 }, { elx: 2, ely: 0 });
+  assert.ok(result !== null, "a solid row should be connected");
+  assert.strictEqual(result.minDensity, 0.3, `minDensity should be the weakest cell (0.3), got ${result.minDensity}`);
+  console.log("✓ minDensity picks out the weakest cell on the path, not the average");
 }
 
 console.log("\nAll checks passed.");

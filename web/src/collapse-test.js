@@ -1,5 +1,6 @@
 import { nodeId, nodeDofs } from "./mesh.js";
 import { runTopologyOptimization } from "./optimize.js";
+import { findConnectedPath } from "./connectivity.js";
 
 const { Engine, Render, Runner, Bodies, Body, Composite, Events, Vector } = window.Matter;
 
@@ -66,6 +67,13 @@ function closestCell(cells, targetElx, targetEly) {
 // truly, unconditionally fixed in place, no settling, no equilibrium to
 // tip over — and only make it dynamic (so it starts falling under
 // gravity) at the moment a hard enough impact says it should.
+//
+// Before building anything physical, check that the support and apex are
+// actually connected by real material (findConnectedPath) — at a low
+// enough volume fraction the optimizer can produce a design with no
+// continuous path at all, and drawing a beam straight through that gap
+// would be showing something the optimizer never actually built. Returns
+// null in that case instead of a half-built lie.
 function buildHalf(columnFilter, supportElx) {
   const cells = [];
   for (let ely = 0; ely < numElemY; ely++) {
@@ -74,9 +82,18 @@ function buildHalf(columnFilter, supportElx) {
       cells.push({ elx, ely, x: physicsX(elx), y: physicsY(ely) });
     }
   }
+  if (cells.length === 0) return null;
 
   const bottomCell = closestCell(cells, supportElx, 0);
   const topCell = closestCell(cells, numElemX / 2, numElemY);
+
+  const connection = findConnectedPath(
+    densities,
+    DENSITY_THRESHOLD,
+    { elx: bottomCell.elx, ely: bottomCell.ely },
+    { elx: topCell.elx, ely: topCell.ely }
+  );
+  if (!connection) return null;
 
   const dx = topCell.x - bottomCell.x;
   const dy = topCell.y - bottomCell.y;
@@ -97,12 +114,22 @@ function buildHalf(columnFilter, supportElx) {
   Body.setStatic(body, true);
   Composite.add(world, body);
 
-  return { body };
+  return { body, minDensity: connection.minDensity };
 }
 
 const midColumn = numElemX / 2;
 const left = buildHalf((elx) => elx <= midColumn, 0);
 const right = buildHalf((elx) => elx > midColumn, numElemX);
+
+if (!left || !right) {
+  // No continuous path at this volume fraction / load position — the
+  // real UI will turn this into "this amount of material can't even form
+  // a structure here," but for this prototype, say so loudly and stop
+  // rather than building physics on top of a strut that doesn't exist.
+  throw new Error(
+    `No connected path from support to apex on ${!left ? "the left" : ""}${!left && !right ? " and " : ""}${!right ? "the right" : ""} side — volumeFraction ${volumeFraction} is too low for this load position.`
+  );
+}
 
 // Ground + walls so debris settles instead of falling forever.
 const ground = Bodies.rectangle(canvasWidth / 2, canvasHeight - 10, canvasWidth, 20, { isStatic: true });
@@ -115,20 +142,29 @@ Composite.add(world, [ground, leftWall, rightWall]);
 const testBall = Bodies.circle(physicsX(midColumn), 20, 18, { density: 0.05, friction: 0.9, restitution: 0.1 });
 Composite.add(world, testBall);
 
-// Breaking is now a collision question, not a constraint-strain question:
-// on impact, momentum (mass x speed) standing in for how hard the ball
-// hit. Above BREAK_MOMENTUM, whichever beam(s) it hit stop being static
-// and start falling like any other dynamic body from that point on.
-const BREAK_MOMENTUM = 60;
+// Breaking is a collision question, not a constraint-strain question: on
+// impact, momentum (mass x speed) stands in for how hard the ball hit.
+// Above that beam's break threshold, it stops being static and starts
+// falling like any other dynamic body from that point on.
+//
+// The threshold isn't the same fixed number for every beam — it's scaled
+// by that beam's own minDensity (the weakest point found along its actual
+// connected path). A beam the optimizer built thin should be easier to
+// break than one it built thick, or the material budget the user chose
+// would have no effect on the outcome at all — which was exactly the gap
+// this replaces.
+const BASE_BREAK_MOMENTUM = 60;
 Events.on(engine, "collisionStart", (event) => {
   for (const pair of event.pairs) {
-    const beam = [pair.bodyA, pair.bodyB].find((b) => (b === left.body || b === right.body) && b.isStatic);
-    const ball = [pair.bodyA, pair.bodyB].find((b) => b === testBall);
-    if (!beam || !ball) continue;
+    const bodies = [pair.bodyA, pair.bodyB];
+    const half = [left, right].find((h) => bodies.includes(h.body) && h.body.isStatic);
+    const ball = bodies.find((b) => b === testBall);
+    if (!half || !ball) continue;
 
     const momentum = ball.mass * Vector.magnitude(ball.velocity);
-    if (momentum > BREAK_MOMENTUM) {
-      Body.setStatic(beam, false);
+    const breakMomentum = BASE_BREAK_MOMENTUM * half.minDensity;
+    if (momentum > breakMomentum) {
+      Body.setStatic(half.body, false);
     }
   }
 });
