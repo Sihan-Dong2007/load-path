@@ -12,6 +12,9 @@ import { getElementStiffnessMatrix, matVec } from "./web/src/fem.js";
 import { assembleGlobalStiffness, solidDensities } from "./web/src/assemble.js";
 import { numDofs, nodeId, nodeDofs } from "./web/src/mesh.js";
 import { solveDisplacement } from "./web/src/structure.js";
+import { computeSensitivities } from "./web/src/sensitivity.js";
+import { filterSensitivities } from "./web/src/filter.js";
+import { updateDensities } from "./web/src/oc.js";
 
 const EPSILON = 1e-9;
 
@@ -129,6 +132,134 @@ console.log("✓ assembled meshes (1x1 and 3x2) are symmetric with zero rigid-bo
     }
   }
   console.log("✓ the displacement field is left-right symmetric, as the setup requires");
+}
+
+// 6. Sensitivities on that same symmetric bridge setup: every sensitivity
+// must be <= 0 (removing material never helps compliance), and — because
+// the setup is left-right symmetric — mirrored elements must get the same
+// sensitivity.
+{
+  const numElemX = 4;
+  const numElemY = 2;
+  const densities = solidDensities(numElemX, numElemY);
+
+  const bottomLeft = nodeId(0, 0, numElemX);
+  const bottomRight = nodeId(numElemX, 0, numElemX);
+  const fixedDofs = [...nodeDofs(bottomLeft), ...nodeDofs(bottomRight)];
+
+  const topCenter = nodeId(numElemX / 2, numElemY, numElemX);
+  const [, topCenterY] = nodeDofs(topCenter);
+  const loads = [[topCenterY, -1]];
+
+  const u = solveDisplacement(numElemX, numElemY, densities, fixedDofs, loads);
+  const dc = computeSensitivities(numElemX, numElemY, densities, u);
+
+  for (let ely = 0; ely < numElemY; ely++) {
+    for (let elx = 0; elx < numElemX; elx++) {
+      assert.ok(
+        dc[ely][elx] <= EPSILON,
+        `dc[${ely}][${elx}]=${dc[ely][elx]} should be <= 0`
+      );
+    }
+  }
+  console.log("✓ every sensitivity is <= 0");
+
+  for (let ely = 0; ely < numElemY; ely++) {
+    for (let elx = 0; elx < numElemX; elx++) {
+      const mirrorElx = numElemX - 1 - elx;
+      assert.ok(
+        Math.abs(dc[ely][elx] - dc[ely][mirrorElx]) < 1e-6,
+        `dc[${ely}][${elx}]=${dc[ely][elx]} should match mirror dc[${ely}][${mirrorElx}]=${dc[ely][mirrorElx]}`
+      );
+    }
+  }
+  console.log("✓ sensitivities are left-right symmetric");
+}
+
+// 7. Filtering: a uniform field should pass through unchanged (there's
+// nothing to smooth toward), while a single spike in an otherwise-zero
+// field should get smaller at the spike and spread to its neighbors —
+// otherwise the filter isn't actually averaging with neighbors.
+{
+  const numElemX = 5;
+  const numElemY = 5;
+  const uniformDensities = solidDensities(numElemX, numElemY);
+  const uniformSensitivities = Array.from({ length: numElemY }, () => new Array(numElemX).fill(-5));
+
+  const filteredUniform = filterSensitivities(numElemX, numElemY, uniformDensities, uniformSensitivities, 1.5);
+  for (let ely = 0; ely < numElemY; ely++) {
+    for (let elx = 0; elx < numElemX; elx++) {
+      assert.ok(
+        Math.abs(filteredUniform[ely][elx] - -5) < EPSILON,
+        `filtered uniform field at [${ely}][${elx}] should stay -5, got ${filteredUniform[ely][elx]}`
+      );
+    }
+  }
+  console.log("✓ filtering a uniform field leaves it unchanged");
+
+  const spike = Array.from({ length: numElemY }, () => new Array(numElemX).fill(0));
+  spike[2][2] = -100;
+  const filteredSpike = filterSensitivities(numElemX, numElemY, uniformDensities, spike, 1.5);
+
+  assert.ok(
+    Math.abs(filteredSpike[2][2]) < 100,
+    `filtered spike at the center should be smaller in magnitude than the raw -100, got ${filteredSpike[2][2]}`
+  );
+  assert.ok(
+    filteredSpike[2][1] < 0 && filteredSpike[1][2] < 0,
+    "the spike should spread some (negative) sensitivity to its immediate neighbors"
+  );
+  assert.ok(
+    Math.abs(filteredSpike[0][0]) < EPSILON,
+    "a corner far from the spike should be unaffected"
+  );
+  console.log("✓ filtering spreads a spike to its neighbors instead of passing it through untouched");
+}
+
+// 8. OC density update: starting from a uniform design already at the
+// target volume fraction, a uniform sensitivity field should leave it
+// uniform (nothing distinguishes one element from another). A non-uniform
+// sensitivity field should push more material toward the elements with the
+// larger-magnitude (more negative) sensitivity, while still respecting the
+// overall volume constraint.
+{
+  const numElemX = 4;
+  const numElemY = 4;
+  const volumeFraction = 0.5;
+  const startDensities = Array.from({ length: numElemY }, () => new Array(numElemX).fill(volumeFraction));
+
+  const uniformDc = Array.from({ length: numElemY }, () => new Array(numElemX).fill(-1));
+  const uniformResult = updateDensities(numElemX, numElemY, startDensities, uniformDc, volumeFraction);
+  for (let ely = 0; ely < numElemY; ely++) {
+    for (let elx = 0; elx < numElemX; elx++) {
+      assert.ok(
+        Math.abs(uniformResult[ely][elx] - volumeFraction) < 1e-3,
+        `uniform update at [${ely}][${elx}] should stay near ${volumeFraction}, got ${uniformResult[ely][elx]}`
+      );
+    }
+  }
+  console.log("✓ a uniform sensitivity field keeps a uniform design uniform, at the target volume");
+
+  // Left half is much more "important" (larger-magnitude sensitivity) than
+  // the right half.
+  const skewedDc = Array.from({ length: numElemY }, (_, ely) =>
+    Array.from({ length: numElemX }, (_, elx) => (elx < numElemX / 2 ? -10 : -0.1))
+  );
+  const skewedResult = updateDensities(numElemX, numElemY, startDensities, skewedDc, volumeFraction);
+
+  for (let ely = 0; ely < numElemY; ely++) {
+    assert.ok(
+      skewedResult[ely][0] > skewedResult[ely][numElemX - 1],
+      `row ${ely}: the more-important left element (${skewedResult[ely][0]}) should end up denser than the less-important right element (${skewedResult[ely][numElemX - 1]})`
+    );
+  }
+  const skewedVolume = skewedResult.flat().reduce((sum, x) => sum + x, 0);
+  const targetVolume = volumeFraction * numElemX * numElemY;
+  assert.ok(
+    Math.abs(skewedVolume - targetVolume) < 0.5,
+    `total volume ${skewedVolume} should stay near the target ${targetVolume}`
+  );
+  console.log("✓ a skewed sensitivity field shifts material toward the more important elements, near the target volume");
 }
 
 console.log("\nAll checks passed.");
