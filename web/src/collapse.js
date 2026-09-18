@@ -3,17 +3,8 @@ import { buildShards, polygonCentroid } from "./fracture.js";
 import { createDustSystem } from "./dust.js";
 import { playImpact, playBreak } from "./sound.js";
 import { WEIGHT_EXPONENT_MIN, WEIGHT_EXPONENT_MAX } from "./units.js";
-import {
-  SKY_COLOR,
-  STONE_COLOR,
-  STONE_STROKE,
-  BROKEN_STONE_COLOR,
-  BROKEN_STONE_STROKE,
-  GROUND_COLOR,
-  GROUND_STROKE,
-  WEIGHT_COLOR,
-  WEIGHT_STROKE,
-} from "./theme.js";
+import { drawShard, drawWeight } from "./stone.js";
+import { DOMAIN, SCENE_W, SCENE_H, BANK_TOP_Y, RIVER_LEFT_X, RIVER_RIGHT_X, RIVERBED_Y } from "./scene.js";
 
 const { Engine, Render, Runner, Bodies, Body, Composite, Vector } = window.Matter;
 
@@ -57,32 +48,30 @@ function shardCountFor(cellCount) {
 // there's nothing to test, so the caller should treat that as an
 // automatic failure without spawning any physics. Otherwise returns an
 // object with dropBall()/hasSettled()/collapsed()/stop().
-export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas, domainHeight }) {
+export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas }) {
   const evaluation = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg });
   if (!evaluation.ok) return { ok: false };
 
-  const canvasWidth = canvas.width;
-  const canvasHeight = canvas.height;
-  const cellWidth = canvasWidth / numElemX;
-  const cellHeight = domainHeight / numElemY;
-  const physicsX = (elx) => elx * cellWidth + cellWidth / 2;
-  const physicsY = (ely) => domainHeight - (ely * cellHeight + cellHeight / 2); // flip: ely up == y down
+  const cellWidth = DOMAIN.w / numElemX;
+  const cellHeight = DOMAIN.h / numElemY;
+  const domainBottom = DOMAIN.y + DOMAIN.h;
+  const physicsX = (elx) => DOMAIN.x + elx * cellWidth + cellWidth / 2;
+  const physicsY = (ely) => domainBottom - (ely * cellHeight + cellHeight / 2); // flip: ely up == y down
 
   const engine = Engine.create();
   const world = engine.world;
 
-  // Riverbank/canyon floor the bridge spans — real (collidable) here, unlike
-  // the painted copy drawn during the growth animation, so debris that
-  // breaks free has somewhere to land instead of falling off-canvas.
-  const groundThickness = canvasHeight - domainHeight;
-  Composite.add(
-    world,
-    Bodies.rectangle(canvasWidth / 2, domainHeight + groundThickness / 2, canvasWidth * 1.4, groundThickness, {
-      isStatic: true,
-      friction: 0.9,
-      render: { fillStyle: GROUND_COLOR, strokeStyle: GROUND_STROKE, lineWidth: 2 },
-    })
-  );
+  // The cliffs the bridge rests on and the riverbed between them — real
+  // (collidable) bodies, so debris that breaks free lands on something
+  // instead of falling off-screen. Invisible to Matter's renderer: the
+  // backdrop already paints them.
+  const invisible = { isStatic: true, friction: 0.9, render: { visible: false } };
+  const slab = (x0, x1, top) => Bodies.rectangle((x0 + x1) / 2, top + 200, x1 - x0, 400, invisible);
+  Composite.add(world, [
+    slab(-400, RIVER_LEFT_X, BANK_TOP_Y),
+    slab(RIVER_RIGHT_X, SCENE_W + 400, BANK_TOP_Y),
+    slab(RIVER_LEFT_X, RIVER_RIGHT_X, RIVERBED_Y),
+  ]);
 
   // A cell's 4 corners in physics/canvas space — the same rectangle
   // renderDensities() draws for that cell, just without its 1px overlap
@@ -90,9 +79,9 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
   // boundary, so any interior seams between neighboring cells disappear
   // into the hull anyway).
   function cellCorners(elx, ely) {
-    const xLeft = elx * cellWidth;
+    const xLeft = DOMAIN.x + elx * cellWidth;
     const xRight = xLeft + cellWidth;
-    const yBottom = domainHeight - ely * cellHeight;
+    const yBottom = domainBottom - ely * cellHeight;
     const yTop = yBottom - cellHeight;
     return [
       { x: xLeft, y: yTop },
@@ -109,6 +98,7 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
   // the whole group is set dynamic together the moment this half is
   // determined to fail (see markBroken below), not per-shard, since the
   // physics decision itself is made at the half level, not the shard level.
+  let nextShardSeed = 1;
   function buildShardBodies(half) {
     const shards = buildShards(half.cells, shardCountFor(half.cells.length), (cell) => cellCorners(cell.elx, cell.ely));
     return shards.map(({ vertices }) => {
@@ -117,8 +107,9 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
         friction: 0.9,
         isStatic: true,
         collisionFilter: { group: SHARD_GROUP },
-        render: { fillStyle: STONE_COLOR, strokeStyle: STONE_STROKE, lineWidth: 1 },
+        render: { visible: false }, // drawn by drawShard() in the afterRender hook
       });
+      body.plugin = { seed: nextShardSeed++, broken: false };
       Composite.add(world, body);
       return body;
     });
@@ -139,16 +130,25 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     friction: 0.9,
     restitution: 0.1,
     isStatic: true, // starts suspended — "the weight resting where you placed it"
-    render: { fillStyle: WEIGHT_COLOR, strokeStyle: WEIGHT_STROKE, lineWidth: 2 },
+    render: { visible: false }, // drawn by drawWeight() in the afterRender hook
   });
   Composite.add(world, testBall);
 
   const render = Render.create({
     canvas,
     engine,
-    options: { width: canvasWidth, height: canvasHeight, wireframes: false, background: SKY_COLOR },
+    // Transparent: the backdrop canvas underneath shows through.
+    options: { width: SCENE_W, height: SCENE_H, wireframes: false, background: "transparent" },
   });
   const runner = Runner.create();
+
+  // Registered BEFORE the dust system so the puffs draw on top of the stone.
+  window.Matter.Events.on(render, "afterRender", () => {
+    const ctx = render.context;
+    for (const body of leftShards) drawShard(ctx, body);
+    for (const body of rightShards) drawShard(ctx, body);
+    drawWeight(ctx, testBall);
+  });
   const dust = createDustSystem(render);
 
   // How hard the drop reads, for both the audio and the dust: derived from
@@ -167,8 +167,7 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
   function markBroken(shards) {
     for (const body of shards) {
       Body.setStatic(body, false);
-      body.render.fillStyle = BROKEN_STONE_COLOR;
-      body.render.strokeStyle = BROKEN_STONE_STROKE;
+      body.plugin.broken = true;
       const size = (body.bounds.max.x - body.bounds.min.x + (body.bounds.max.y - body.bounds.min.y)) / 4;
       dust.spawnBurst(body.position.x, body.position.y, size);
     }

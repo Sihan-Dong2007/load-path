@@ -1,45 +1,81 @@
-// Draws a density grid to a canvas — a warm stone tint fading in with
-// density, so a cell looks more solid the closer it is to full material.
-// Row 0 is the bottom of the domain (this project's y-up convention), but
-// canvas y grows downward, so rows are flipped when drawing.
-import { SKY_COLOR, STONE_COLOR, GROUND_COLOR, GROUND_STROKE } from "./theme.js";
+// Draws the density grid as carved stone onto the (transparent) structure
+// canvas: each cell is stone tinted by density, with a little per-cell
+// variation and a chiseled edge where it borders empty space, under a
+// moonlit top-to-bottom gradient. Row 0 is the bottom of the domain (this
+// project's y-up convention), but canvas y grows downward, so rows are
+// flipped when drawing.
+import { STONE_RGB } from "./theme.js";
+import { DOMAIN } from "./scene.js";
 
-export function renderDensities(ctx, densities, width, height) {
+const SOLID = 0.5;
+
+function cellNoise(elx, ely) {
+  const h = Math.sin(elx * 12.9898 + ely * 78.233) * 43758.5453;
+  return h - Math.floor(h);
+}
+
+export function renderDensities(ctx, densities) {
   const numElemY = densities.length;
   const numElemX = densities[0].length;
-  const cellWidth = width / numElemX;
-  const cellHeight = height / numElemY;
+  const cellWidth = DOMAIN.w / numElemX;
+  const cellHeight = DOMAIN.h / numElemY;
+  const isSolid = (elx, ely) =>
+    elx >= 0 && elx < numElemX && ely >= 0 && ely < numElemY && densities[ely][elx] > SOLID;
 
-  ctx.fillStyle = SKY_COLOR;
-  ctx.fillRect(0, 0, width, height);
+  ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
 
-  ctx.fillStyle = STONE_COLOR;
   for (let ely = 0; ely < numElemY; ely++) {
     for (let elx = 0; elx < numElemX; elx++) {
       const density = densities[ely][elx];
       if (density < 0.02) continue;
 
-      const canvasRow = numElemY - 1 - ely;
+      const x = DOMAIN.x + elx * cellWidth;
+      const y = DOMAIN.y + (numElemY - 1 - ely) * cellHeight;
+      const tint = 0.975 + 0.05 * cellNoise(elx, ely);
       ctx.globalAlpha = density;
+      ctx.fillStyle = `rgb(${Math.round(STONE_RGB[0] * tint)},${Math.round(STONE_RGB[1] * tint)},${Math.round(STONE_RGB[2] * tint)})`;
       // Pad each cell by 1px so adjacent cells don't leave hairline gaps
       // from floating-point rounding.
-      ctx.fillRect(elx * cellWidth, canvasRow * cellHeight, cellWidth + 1, cellHeight + 1);
+      ctx.fillRect(x, y, cellWidth + 1, cellHeight + 1);
     }
   }
   ctx.globalAlpha = 1;
-}
 
-// The ground band below the structural domain — riverbanks/canyon floor the
-// bridge spans. Purely a painted backdrop here; during the collapse scene
-// Matter.js draws its own real (collidable) copy at the same position, so
-// debris that breaks free has something to land on.
-export function drawGround(ctx, width, domainHeight, canvasHeight) {
-  ctx.fillStyle = GROUND_COLOR;
-  ctx.fillRect(0, domainHeight, width, canvasHeight - domainHeight);
-  ctx.strokeStyle = GROUND_STROKE;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(0, domainHeight);
-  ctx.lineTo(width, domainHeight);
-  ctx.stroke();
+  // Chiseled edges: a lit line where solid stone borders empty space above
+  // or to the left, a shaded one below or to the right.
+  const edge = Math.max(2, cellHeight * 0.14);
+  for (let ely = 0; ely < numElemY; ely++) {
+    for (let elx = 0; elx < numElemX; elx++) {
+      if (!isSolid(elx, ely)) continue;
+      const x = DOMAIN.x + elx * cellWidth;
+      const y = DOMAIN.y + (numElemY - 1 - ely) * cellHeight;
+      if (!isSolid(elx, ely + 1)) {
+        ctx.fillStyle = "rgba(255,248,225,0.5)";
+        ctx.fillRect(x, y, cellWidth + 1, edge);
+      }
+      if (!isSolid(elx - 1, ely)) {
+        ctx.fillStyle = "rgba(255,248,225,0.25)";
+        ctx.fillRect(x, y, edge, cellHeight + 1);
+      }
+      if (!isSolid(elx, ely - 1)) {
+        ctx.fillStyle = "rgba(0,0,0,0.38)";
+        ctx.fillRect(x, y + cellHeight - edge, cellWidth + 1, edge + 1);
+      }
+      if (!isSolid(elx + 1, ely)) {
+        ctx.fillStyle = "rgba(0,0,0,0.25)";
+        ctx.fillRect(x + cellWidth - edge, y, edge + 1, cellHeight + 1);
+      }
+    }
+  }
+
+  // Moonlit gradient over the stone only (source-atop paints just where
+  // pixels already exist): lighter toward the top, darker toward the base.
+  ctx.save();
+  ctx.globalCompositeOperation = "source-atop";
+  const shade = ctx.createLinearGradient(0, DOMAIN.y, 0, DOMAIN.y + DOMAIN.h);
+  shade.addColorStop(0, "rgba(255,252,240,0.14)");
+  shade.addColorStop(1, "rgba(0,0,0,0.30)");
+  ctx.fillStyle = shade;
+  ctx.fillRect(DOMAIN.x, DOMAIN.y, DOMAIN.w, DOMAIN.h);
+  ctx.restore();
 }

@@ -1,6 +1,8 @@
 import { nodeId, nodeDofs } from "./mesh.js";
 import { iterateTopologyOptimization } from "./optimize.js";
-import { renderDensities, drawGround } from "./render.js";
+import { renderDensities } from "./render.js";
+import { paintBackdrop, paintWaterOverlay } from "./backdrop.js";
+import { DOMAIN, SCENE_W, SCENE_H } from "./scene.js";
 import { buildCollapseScene } from "./collapse.js";
 import { kgToVolumeFraction, WEIGHT_EXPONENT_MIN, WEIGHT_EXPONENT_MAX } from "./units.js";
 
@@ -16,18 +18,34 @@ const fixedDofs = [...nodeDofs(bottomLeft), ...nodeDofs(bottomRight)];
 const canvas = document.getElementById("stage");
 const ctx = canvas.getContext("2d");
 
-// The structural domain only fills the upper part of the canvas — the
-// bottom strip is a riverbank/canyon floor, painted here and real (as a
-// static Matter body) during the collapse scene, so debris that breaks
-// free has somewhere to visibly land instead of falling off-canvas.
-const GROUND_BAND_PX = 80;
-const domainHeight = canvas.height - GROUND_BAND_PX;
+// The scene is three stacked canvases at a fixed logical size (scene.js): a
+// static backdrop, the structure/physics canvas in the middle, and a
+// translucent water overlay in front. The page scales the whole scene
+// uniformly to fit the screen.
+paintBackdrop(document.getElementById("backdrop"));
+paintWaterOverlay(document.getElementById("overlay"));
+
+const sceneEl = document.getElementById("scene");
+function fitScene() {
+  const scale = Math.min(window.innerWidth / SCENE_W, window.innerHeight / SCENE_H);
+  sceneEl.style.transform = `translate(-50%, -50%) scale(${scale})`;
+  document.documentElement.style.setProperty("--ui", String(Math.min(1.3, Math.max(0.85, window.innerWidth / 1700))));
+}
+fitScene();
+window.addEventListener("resize", fitScene);
+
 const materialSlider = document.getElementById("material-slider");
 const materialLabel = document.getElementById("material-label");
 const weightSlider = document.getElementById("weight-slider");
 const weightLabel = document.getElementById("weight-label");
 const messageEl = document.getElementById("message");
 const handle = document.getElementById("load-handle");
+const panelEl = document.getElementById("panel");
+
+document.getElementById("collapse").addEventListener("click", (event) => {
+  const collapsed = panelEl.classList.toggle("collapsed");
+  event.currentTarget.textContent = collapsed ? "+" : "–";
+});
 
 function getMaterialKg() {
   return Number(materialSlider.value);
@@ -98,6 +116,7 @@ function runFullCycle(loadColumn) {
   const loadDof = nodeDofs(node)[1];
   const loads = [[loadDof, -1]];
 
+  panelEl.classList.add("busy");
   setMessage("Growing the structure…");
   const iterator = iterateTopologyOptimization(numElemX, numElemY, fixedDofs, loads, { volumeFraction });
 
@@ -107,8 +126,7 @@ function runFullCycle(loadColumn) {
     const { value, done } = iterator.next();
     if (done) return;
 
-    renderDensities(ctx, value.densities, canvas.width, domainHeight);
-    drawGround(ctx, canvas.width, domainHeight, canvas.height);
+    renderDensities(ctx, value.densities);
 
     if (!value.converged) {
       requestAnimationFrame(step);
@@ -128,19 +146,22 @@ function startCollapseTest(token, densities, u, loadColumn, materialKg) {
   lastMaterialKg = materialKg;
 
   const testWeightKg = getWeightKg();
-  const scene = buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas, domainHeight });
+  const scene = buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas });
   if (!scene.ok) {
+    panelEl.classList.remove("busy");
     setMessage(`${materialKg}kg of stone can't even form a structure here — try more stone, or a different spot.`);
     return;
   }
 
   activeScene = scene;
+  panelEl.classList.add("busy");
   setMessage("Testing it…");
   scene.dropBall();
 
   function poll() {
     if (token !== currentRunToken) return; // stop() already called by whoever superseded this run
     if (scene.hasSettled()) {
+      panelEl.classList.remove("busy");
       if (scene.collapsed()) {
         setMessage(`It broke under ${testWeightKg}kg. Try more stone, or a different spot.`);
       } else {
@@ -170,8 +191,7 @@ function retest() {
 // Idle until the first drop — a plain solid block, nothing computed yet.
 // Dropping the weight is what starts anything at all.
 const solidBlock = Array.from({ length: numElemY }, () => new Array(numElemX).fill(1));
-renderDensities(ctx, solidBlock, canvas.width, domainHeight);
-drawGround(ctx, canvas.width, domainHeight, canvas.height);
+renderDensities(ctx, solidBlock);
 setMessage("Drag the weight onto the block to begin.");
 
 materialSlider.addEventListener("input", updateLabels);
@@ -193,44 +213,81 @@ weightSlider.addEventListener("change", () => {
 // --- Drag-and-drop: dropping the weight onto the canvas sets a new load
 // column there and reruns the whole cycle from scratch. ---
 
-// Converts a point in page coordinates to the nearest column, or null if
-// the point isn't over the canvas at all. Only the horizontal position is
+// Converts a point in page coordinates to the nearest domain column, or null
+// if the point isn't over the scene at all. Only the horizontal position is
 // used — a dropped weight always rests on top of the structure, never
-// inside it (see main.js history for why: an interior point load is a
-// real FEM stress singularity).
+// inside it (an interior point load is a real FEM stress singularity) — and
+// a drop beside the bridge snaps to its nearest end.
 function clientPointToColumn(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   const relX = (clientX - rect.left) / rect.width;
   const relY = (clientY - rect.top) / rect.height;
   if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return null;
 
-  return Math.round(relX * numElemX);
+  const column = Math.round(((relX * SCENE_W - DOMAIN.x) / DOMAIN.w) * numElemX);
+  return Math.min(numElemX, Math.max(0, column));
 }
 
+// The dragged weight is a free-floating copy on <body>, not the handle
+// itself: the panel is transformed/blurred, which would make a
+// position:fixed child position itself relative to the panel instead of the
+// viewport.
+//
+// Move/up/cancel are listened for on the WINDOW for the length of a drag,
+// rather than relying on pointer capture on the handle: if the browser
+// cancels the gesture or the release lands somewhere unexpected, capture can
+// silently drop the release, leaving the copy stuck on screen and nothing
+// started. A cancel is treated as a drop where the pointer last was.
+let ghost = null;
 let dragOffsetX = 0;
 let dragOffsetY = 0;
+let lastX = 0;
+let lastY = 0;
 
+function onDragMove(event) {
+  lastX = event.clientX;
+  lastY = event.clientY;
+  ghost.style.left = `${lastX - dragOffsetX}px`;
+  ghost.style.top = `${lastY - dragOffsetY}px`;
+}
+
+function endDrag(drop) {
+  window.removeEventListener("pointermove", onDragMove);
+  window.removeEventListener("pointerup", onDragUp);
+  window.removeEventListener("pointercancel", onDragUp);
+  if (ghost) ghost.remove();
+  ghost = null;
+  if (!drop) return;
+
+  const column = clientPointToColumn(lastX, lastY);
+  if (column !== null) runFullCycle(column);
+}
+
+function onDragUp(event) {
+  lastX = event.clientX;
+  lastY = event.clientY;
+  endDrag(true);
+}
+
+handle.addEventListener("dragstart", (event) => event.preventDefault());
 handle.addEventListener("pointerdown", (event) => {
-  handle.setPointerCapture(event.pointerId);
+  event.preventDefault();
+  if (ghost) endDrag(false); // a stale copy from a drag that never ended
+
   const rect = handle.getBoundingClientRect();
   dragOffsetX = event.clientX - rect.left;
   dragOffsetY = event.clientY - rect.top;
-  handle.classList.add("dragging");
-});
+  lastX = event.clientX;
+  lastY = event.clientY;
+  ghost = document.createElement("div");
+  ghost.id = "drag-ghost";
+  ghost.style.width = `${rect.width}px`;
+  ghost.style.height = `${rect.height}px`;
+  ghost.style.left = `${rect.left}px`;
+  ghost.style.top = `${rect.top}px`;
+  document.body.appendChild(ghost);
 
-handle.addEventListener("pointermove", (event) => {
-  if (!handle.classList.contains("dragging")) return;
-  handle.style.left = `${event.clientX - dragOffsetX}px`;
-  handle.style.top = `${event.clientY - dragOffsetY}px`;
-});
-
-handle.addEventListener("pointerup", (event) => {
-  handle.classList.remove("dragging");
-  handle.style.left = "";
-  handle.style.top = "";
-
-  const column = clientPointToColumn(event.clientX, event.clientY);
-  if (column !== null) {
-    runFullCycle(column);
-  }
+  window.addEventListener("pointermove", onDragMove);
+  window.addEventListener("pointerup", onDragUp);
+  window.addEventListener("pointercancel", onDragUp);
 });

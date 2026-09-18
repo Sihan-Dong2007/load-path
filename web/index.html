@@ -4,88 +4,176 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Load Path</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a1729'/%3E%3Cpath d='M2 26V20q14-16 28 0v6h-5v-5q-9-9-18 0v5z' fill='%23cfc3ab'/%3E%3C/svg%3E">
 <style>
+  :root { --ui: 1; --accent: #e6c07b; }
+  *, *::before, *::after { box-sizing: border-box; }
   html, body {
     margin: 0;
     height: 100%;
-    background: #0b1320;
     overflow: hidden;
+    background: #04080f;
+    color: #eef2f6;
+    font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
   }
-  #tray {
-    min-height: 96px;
-    padding: 10px 24px;
-    box-sizing: border-box;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 6px;
+
+  /* The fixed 1920x1080 scene, scaled uniformly to fit by main.js. */
+  #scene {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    width: 1920px;
+    height: 1080px;
+    transform-origin: center;
   }
-  #tray-row {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 20px;
+  #scene canvas { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; display: block; }
+  #overlay { pointer-events: none; }
+
+  #panel {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    width: 276px;
+    padding: 11px 14px 13px;
+    transition: opacity 0.3s ease;
+    transform: scale(var(--ui));
+    transform-origin: top left;
+    background: rgba(8, 18, 30, 0.62);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 16px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.42);
   }
-  #tray-label {
-    color: #8fa3bf;
-    font: 14px system-ui, sans-serif;
+  /* While the bridge grows or is tested the panel steps back so it doesn't
+     cover the action; hovering it brings it back. */
+  #panel.busy:not(:hover) { opacity: 0.38; }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; }
+  #collapse {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    line-height: 1;
+    border-radius: 8px;
+    cursor: pointer;
+    color: #cfdbe7;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
   }
+  #panel.collapsed .sub,
+  #panel.collapsed .control,
+  #panel.collapsed #message,
+  #panel.collapsed .weight-row span { display: none; }
+  #panel.collapsed .weight-row { margin-bottom: 0; }
+  #panel h1 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 650;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  #panel .sub { margin: 2px 0 10px; font-size: 11px; color: #8ea3b8; letter-spacing: 0.04em; }
+
+  .weight-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
   #load-handle {
-    width: 40px;
-    height: 40px;
-    background: #f2545b;
-    border-radius: 6px;
+    width: 38px;
+    height: 38px;
+    flex-shrink: 0;
+    border-radius: 50%;
     cursor: grab;
     touch-action: none;
+    background: radial-gradient(circle at 34% 30%, #f6dc9d, #c08a3a 48%, #4a3010);
+    border: 2px solid rgba(40, 24, 6, 0.8);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+  #load-handle:active { cursor: grabbing; }
+  .weight-row span { font-size: 12.5px; color: #cfdbe7; line-height: 1.35; }
+
+  #drag-ghost {
+    position: fixed;
+    z-index: 50;
+    pointer-events: none;
+    border-radius: 50%;
+    background: radial-gradient(circle at 34% 30%, #f6dc9d, #c08a3a 48%, #4a3010);
+    border: 2px solid rgba(40, 24, 6, 0.8);
+    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.6);
+    transform: scale(1.25);
+  }
+
+  .control { display: block; margin: 10px 0 0; }
+  .control .head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .control .name {
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #8ea3b8;
     flex-shrink: 0;
   }
-  #load-handle.dragging {
-    position: fixed;
-    z-index: 10;
-    cursor: grabbing;
+  .control output { font-size: 12px; color: #f1dcae; text-align: right; font-variant-numeric: tabular-nums; }
+
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 20px; margin: 4px 0 0; background: transparent; }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(90deg, #8a6a33, #e6c07b);
   }
-  #material-control {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: #8fa3bf;
-    font: 14px system-ui, sans-serif;
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    margin-top: -6px;
+    border-radius: 50%;
+    background: #fff4dc;
+    border: 2px solid #b8893f;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
   }
-  #material-label {
-    color: #e6edf7;
-    min-width: 3.5em;
-  }
+  input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: linear-gradient(90deg, #8a6a33, #e6c07b); }
+  input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #fff4dc; border: 2px solid #b8893f; }
+
   #message {
-    color: #e6edf7;
-    font: 14px system-ui, sans-serif;
-    min-height: 1.2em;
-  }
-  canvas {
-    display: block;
-    width: 100vw;
-    height: calc(100vh - 96px);
+    margin-top: 14px;
+    padding-top: 11px;
+    border-top: 1px solid rgba(255, 255, 255, 0.09);
+    font-size: 12.5px;
+    color: #eef2f6;
+    min-height: 2.9em;
   }
 </style>
 </head>
 <body>
-<div id="tray">
-  <div id="tray-row">
-    <span id="tray-label">Drag the weight onto the structure:</span>
-    <div id="load-handle"></div>
-    <label id="material-control">
-      Stone (kg):
-      <input type="range" id="material-slider" min="230" max="1560" step="10" value="620">
-      <span id="material-label">620 kg</span>
-    </label>
-    <label id="material-control">
-      Test weight:
-      <input type="range" id="weight-slider" min="0" max="1000" step="1" value="600">
-      <span id="weight-label">— kg</span>
-    </label>
+<div id="scene">
+  <canvas id="backdrop" width="1920" height="1080"></canvas>
+  <canvas id="stage" width="1920" height="1080"></canvas>
+  <canvas id="overlay" width="1920" height="1080"></canvas>
+</div>
+
+<div id="panel">
+  <div class="panel-head">
+    <h1>Load Path</h1>
+    <button id="collapse" title="Collapse panel">–</button>
   </div>
+  <div class="sub">a stone bridge, grown by algorithm</div>
+
+  <div class="weight-row">
+    <div id="load-handle" title="Drag onto the bridge"></div>
+    <span>Drag the weight onto the bridge</span>
+  </div>
+
+  <label class="control">
+    <span class="head"><span class="name">Stone</span><output id="material-label"></output></span>
+    <input type="range" id="material-slider" min="230" max="1560" step="10" value="620">
+  </label>
+  <label class="control">
+    <span class="head"><span class="name">Test weight</span><output id="weight-label"></output></span>
+    <input type="range" id="weight-slider" min="0" max="1000" step="1" value="600">
+  </label>
+
   <div id="message"></div>
 </div>
-<canvas id="stage" width="1200" height="680"></canvas>
+
 <script src="vendor/matter.min.js"></script>
 <script type="module" src="src/main.js"></script>
 </body>
