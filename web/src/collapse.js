@@ -1,4 +1,7 @@
 import { evaluateHalves } from "./failure.js";
+import { buildShards, polygonCentroid } from "./fracture.js";
+import { createDustSystem } from "./dust.js";
+import { playImpact, playBreak } from "./sound.js";
 import {
   SKY_COLOR,
   STONE_COLOR,
@@ -16,6 +19,19 @@ const { Engine, Render, Runner, Bodies, Body, Composite, Vector } = window.Matte
 const SETTLE_SPEED = 0.05;
 const SETTLE_FRAMES_REQUIRED = 30;
 const MAX_FRAMES = 600; // ~10s safety cap in case something never quite settles
+
+// Every shard body shares this (negative) collision group, meaning members
+// never collide with each other — the same trick the old single-beam
+// version used at the apex, now needed everywhere two shards touch,
+// including neighboring shards within the same half.
+const SHARD_GROUP = -1;
+const MIN_SHARDS = 3;
+const MAX_SHARDS = 7;
+const CELLS_PER_SHARD_TARGET = 25;
+
+function shardCountFor(cellCount) {
+  return Math.max(MIN_SHARDS, Math.min(MAX_SHARDS, Math.round(cellCount / CELLS_PER_SHARD_TARGET)));
+}
 
 // Builds a physics scene testing whether a converged density grid holds
 // under a given real-world test weight, drawing onto the SAME canvas the
@@ -62,38 +78,50 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     })
   );
 
-  function buildBody(half) {
-    const bottomX = physicsX(half.bottomCell.elx);
-    const bottomY = physicsY(half.bottomCell.ely);
-    const topX = physicsX(half.topCell.elx);
-    const topY = physicsY(half.topCell.ely);
-
-    const dx = topX - bottomX;
-    const dy = topY - bottomY;
-    const length = Math.hypot(dx, dy);
-    const angle = Math.atan2(dy, dx);
-    const centerX = (bottomX + topX) / 2;
-    const centerY = (bottomY + topY) / 2;
-    const thickness = Math.max(cellWidth, cellHeight) * 1.4;
-    const overlap = Math.max(cellWidth, cellHeight);
-
-    // A bit longer than the true support-to-apex distance so the two
-    // beams' tips overlap at the top, giving a dropped weight a solid
-    // surface to land on. High friction so it settles where it lands.
-    const body = Bodies.rectangle(centerX, centerY, length + overlap, thickness, {
-      friction: 0.9,
-      render: { fillStyle: STONE_COLOR, strokeStyle: STONE_STROKE, lineWidth: 2 },
-    });
-    Body.setAngle(body, angle);
-    body.collisionFilter.group = -1; // the two beams overlap by design near the apex
-    Body.setStatic(body, true);
-    Composite.add(world, body);
-    return body;
+  // A cell's 4 corners in physics/canvas space — the same rectangle
+  // renderDensities() draws for that cell, just without its 1px overlap
+  // padding (irrelevant here: a shard's hull only keeps its group's outer
+  // boundary, so any interior seams between neighboring cells disappear
+  // into the hull anyway).
+  function cellCorners(elx, ely) {
+    const xLeft = elx * cellWidth;
+    const xRight = xLeft + cellWidth;
+    const yBottom = domainHeight - ely * cellHeight;
+    const yTop = yBottom - cellHeight;
+    return [
+      { x: xLeft, y: yTop },
+      { x: xRight, y: yTop },
+      { x: xRight, y: yBottom },
+      { x: xLeft, y: yBottom },
+    ];
   }
 
-  const leftBody = buildBody(evaluation.left);
-  const rightBody = buildBody(evaluation.right);
+  // One half's real, irregular shape — the same solid cells the strength
+  // check evaluated, not an idealized straight beam — split into a few
+  // convex shards so a failure can shatter it instead of dropping one
+  // rigid slab. All shards start static (the half "resting" as tested);
+  // the whole group is set dynamic together the moment this half is
+  // determined to fail (see markBroken below), not per-shard, since the
+  // physics decision itself is made at the half level, not the shard level.
+  function buildShardBodies(half) {
+    const shards = buildShards(half.cells, shardCountFor(half.cells.length), (cell) => cellCorners(cell.elx, cell.ely));
+    return shards.map(({ vertices }) => {
+      const { x: centerX, y: centerY } = polygonCentroid(vertices);
+      const body = Bodies.fromVertices(centerX, centerY, [vertices], {
+        friction: 0.9,
+        isStatic: true,
+        collisionFilter: { group: SHARD_GROUP },
+        render: { fillStyle: STONE_COLOR, strokeStyle: STONE_STROKE, lineWidth: 1 },
+      });
+      Composite.add(world, body);
+      return body;
+    });
+  }
+
+  const leftShards = buildShardBodies(evaluation.left);
+  const rightShards = buildShardBodies(evaluation.right);
   const willBreak = { left: evaluation.left.fails, right: evaluation.right.fails };
+  const triggered = { left: false, right: false };
 
   const ballRadius = Math.max(cellWidth, cellHeight) * 1.2;
   const dropStartY = physicsY(numElemY) - ballRadius * 3;
@@ -109,31 +137,61 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
   });
   Composite.add(world, testBall);
 
-  // Beyond animating the fall, breaking also recolors a beam to a duller,
-  // dustier stone tone — a second, non-motion cue that this is the piece
-  // the physics decided would fail.
-  function markBroken(body) {
-    Body.setStatic(body, false);
-    body.render.fillStyle = BROKEN_STONE_COLOR;
-    body.render.strokeStyle = BROKEN_STONE_STROKE;
-  }
-
-  const { Events } = window.Matter;
-  Events.on(engine, "collisionStart", (event) => {
-    for (const pair of event.pairs) {
-      const bodies = [pair.bodyA, pair.bodyB];
-      if (!bodies.includes(testBall)) continue;
-      if (bodies.includes(leftBody) && leftBody.isStatic && willBreak.left) markBroken(leftBody);
-      if (bodies.includes(rightBody) && rightBody.isStatic && willBreak.right) markBroken(rightBody);
-    }
-  });
-
   const render = Render.create({
     canvas,
     engine,
     options: { width: canvasWidth, height: canvasHeight, wireframes: false, background: SKY_COLOR },
   });
   const runner = Runner.create();
+  const dust = createDustSystem(render);
+
+  // How hard the drop reads, for both the audio and the dust: derived from
+  // the same real-unit exponent range main.js maps the weight slider onto
+  // (10^5 - 10^8 kg), so a heavier test weight sounds and looks heavier,
+  // not just "breaks or doesn't."
+  const impactIntensity = Math.min(1, Math.max(0, (Math.log10(testWeightKg) - 5) / 3));
+
+  // Beyond animating the fall, breaking also recolors every shard in that
+  // half to a duller, dustier stone tone and kicks up a dust puff at each
+  // one — cues on top of the motion itself that this is the half the
+  // physics decided would fail.
+  function markBroken(shards) {
+    for (const body of shards) {
+      Body.setStatic(body, false);
+      body.render.fillStyle = BROKEN_STONE_COLOR;
+      body.render.strokeStyle = BROKEN_STONE_STROKE;
+      const size = (body.bounds.max.x - body.bounds.min.x + (body.bounds.max.y - body.bounds.min.y)) / 4;
+      dust.spawnBurst(body.position.x, body.position.y, size);
+    }
+  }
+
+  // The first ball-structure contact always gets an impact thud, whether or
+  // not anything ends up breaking; a half's own break sound plays on top of
+  // that, once, the moment it's triggered.
+  let hasImpacted = false;
+
+  const { Events } = window.Matter;
+  Events.on(engine, "collisionStart", (event) => {
+    for (const pair of event.pairs) {
+      const bodies = [pair.bodyA, pair.bodyB];
+      if (!bodies.includes(testBall)) continue;
+
+      if (!hasImpacted) {
+        hasImpacted = true;
+        playImpact(impactIntensity);
+      }
+      if (!triggered.left && willBreak.left && bodies.some((b) => leftShards.includes(b))) {
+        triggered.left = true;
+        markBroken(leftShards);
+        playBreak(impactIntensity);
+      }
+      if (!triggered.right && willBreak.right && bodies.some((b) => rightShards.includes(b))) {
+        triggered.right = true;
+        markBroken(rightShards);
+        playBreak(impactIntensity);
+      }
+    }
+  });
 
   let settledFrames = 0;
   let totalFrames = 0;
@@ -149,15 +207,13 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
       totalFrames++;
       if (totalFrames > MAX_FRAMES) return true;
 
-      const speeds = [Vector.magnitude(testBall.velocity)];
-      if (!leftBody.isStatic) speeds.push(Vector.magnitude(leftBody.velocity));
-      if (!rightBody.isStatic) speeds.push(Vector.magnitude(rightBody.velocity));
-
+      const dynamicBodies = [testBall, ...leftShards, ...rightShards].filter((b) => !b.isStatic);
+      const speeds = dynamicBodies.map((b) => Vector.magnitude(b.velocity));
       settledFrames = Math.max(...speeds) < SETTLE_SPEED ? settledFrames + 1 : 0;
       return settledFrames > SETTLE_FRAMES_REQUIRED;
     },
     collapsed() {
-      return !leftBody.isStatic || !rightBody.isStatic;
+      return triggered.left || triggered.right;
     },
     stop() {
       Runner.stop(runner);

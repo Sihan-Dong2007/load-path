@@ -24,6 +24,7 @@ import { findConnectedPath } from "./web/src/connectivity.js";
 import { computeStrain, planeStressD, computeStress, principalStresses, maxPrincipalStress } from "./web/src/stress.js";
 import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from "./web/src/buckling.js";
 import { evaluateHalves } from "./web/src/failure.js";
+import { convexHull, polygonCentroid, groupCellsBySeed, buildShards } from "./web/src/fracture.js";
 import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2 } from "./web/src/units.js";
 
 const EPSILON = 1e-9;
@@ -617,6 +618,124 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   assert.ok(heavy.left.fails && heavy.right.fails, "an absurdly heavy test weight must fail both sides");
 
   console.log("✓ failure evaluation: stress ratio scales linearly with weight, is symmetric for a symmetric setup, and a heavy enough weight fails");
+}
+
+// 25. Convex hull: a square with a point in its interior and a point
+// exactly on one of its edges must both be dropped — the hull is exactly
+// the 4 corners.
+{
+  const points = [
+    { x: 0, y: 0 }, { x: 4, y: 0 }, { x: 4, y: 4 }, { x: 0, y: 4 },
+    { x: 2, y: 2 }, // interior
+    { x: 2, y: 0 }, // on an edge
+  ];
+  const hull = convexHull(points);
+  assert.equal(hull.length, 4, `hull should have exactly 4 vertices, got ${hull.length}`);
+  for (const corner of [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 4, y: 4 }, { x: 0, y: 4 }]) {
+    assert.ok(
+      hull.some((p) => p.x === corner.x && p.y === corner.y),
+      `hull should include corner (${corner.x},${corner.y})`
+    );
+  }
+  console.log("✓ convex hull drops interior and collinear-edge points, keeping exactly the 4 corners");
+}
+
+// 26. Polygon centroid: a unit square's centroid is its center, and a
+// triangle's centroid happens to equal the plain average of its vertices
+// (a fact true only for triangles) — both hand-checkable, and this is the
+// exact formula collapse.js relies on matching Matter.js's own Vertices.centre.
+{
+  const square = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
+  const squareCentroid = polygonCentroid(square);
+  assert.ok(Math.abs(squareCentroid.x - 0.5) < 1e-9 && Math.abs(squareCentroid.y - 0.5) < 1e-9,
+    `unit square centroid should be (0.5,0.5), got (${squareCentroid.x},${squareCentroid.y})`);
+
+  const triangle = [{ x: 0, y: 0 }, { x: 3, y: 0 }, { x: 0, y: 3 }];
+  const triangleCentroid = polygonCentroid(triangle);
+  assert.ok(Math.abs(triangleCentroid.x - 1) < 1e-9 && Math.abs(triangleCentroid.y - 1) < 1e-9,
+    `triangle centroid should be (1,1), got (${triangleCentroid.x},${triangleCentroid.y})`);
+  console.log("✓ polygon centroid matches hand-computed values for a square and a triangle");
+}
+
+// 27. Grouping cells by nearest seed must be a strict partition: every cell
+// assigned to exactly one group, and the union recovers the original set —
+// this is what guarantees fracturing a shape never drops or duplicates
+// material.
+{
+  const cells = [];
+  for (let ely = 0; ely < 6; ely++) {
+    for (let elx = 0; elx < 10; elx++) cells.push({ elx, ely });
+  }
+  const groups = groupCellsBySeed(cells, 4);
+  assert.ok(groups.length > 0 && groups.length <= 4, `expected 1-4 non-empty groups, got ${groups.length}`);
+
+  const seen = new Set();
+  let total = 0;
+  for (const group of groups) {
+    assert.ok(group.length > 0, "groupCellsBySeed should never return an empty group");
+    for (const cell of group) {
+      const key = `${cell.elx},${cell.ely}`;
+      assert.ok(!seen.has(key), `cell (${cell.elx},${cell.ely}) should not appear in more than one group`);
+      seen.add(key);
+      total++;
+    }
+  }
+  assert.equal(total, cells.length, "every cell must be assigned to exactly one group");
+  console.log("✓ groupCellsBySeed partitions all cells with no duplicates or omissions");
+}
+
+// 28. End-to-end shard building on a real converged shape's half: every
+// shard's polygon must be a valid, non-degenerate hull (>= 3 vertices,
+// positive area), and the shards collectively account for every solid
+// cell in that half exactly once.
+{
+  const numElemX = 20;
+  const numElemY = 10;
+  const volumeFraction = 0.4;
+  const loadColumn = numElemX / 2;
+
+  const bottomLeft = nodeId(0, 0, numElemX);
+  const bottomRight = nodeId(numElemX, 0, numElemX);
+  const fixedDofs = [...nodeDofs(bottomLeft), ...nodeDofs(bottomRight)];
+  const node = nodeId(loadColumn, numElemY, numElemX);
+  const [, loadDof] = nodeDofs(node);
+  const { densities } = runTopologyOptimization(numElemX, numElemY, fixedDofs, [[loadDof, -1]], { volumeFraction });
+
+  const cells = [];
+  for (let ely = 0; ely < numElemY; ely++) {
+    for (let elx = 0; elx < loadColumn; elx++) {
+      if (densities[ely][elx] > 0.5) cells.push({ elx, ely });
+    }
+  }
+  assert.ok(cells.length > 0, "the left half should have some solid material at this volume fraction");
+
+  const cellCorners = (cell) => [
+    { x: cell.elx, y: cell.ely },
+    { x: cell.elx + 1, y: cell.ely },
+    { x: cell.elx + 1, y: cell.ely + 1 },
+    { x: cell.elx, y: cell.ely + 1 },
+  ];
+  const shards = buildShards(cells, 5, cellCorners);
+  assert.ok(shards.length > 0, "should produce at least one shard");
+
+  const seen = new Set();
+  for (const shard of shards) {
+    assert.ok(shard.vertices.length >= 3, `every shard's hull must have at least 3 vertices, got ${shard.vertices.length}`);
+    const area = Math.abs(
+      shard.vertices.reduce((sum, p, i) => {
+        const q = shard.vertices[(i + 1) % shard.vertices.length];
+        return sum + (p.x * q.y - q.x * p.y);
+      }, 0) / 2
+    );
+    assert.ok(area > 0, "every shard's hull must have positive area");
+    for (const cell of shard.cells) {
+      const key = `${cell.elx},${cell.ely}`;
+      assert.ok(!seen.has(key), `cell (${cell.elx},${cell.ely}) should not appear in more than one shard`);
+      seen.add(key);
+    }
+  }
+  assert.equal(seen.size, cells.length, "shards together must account for every solid cell exactly once");
+  console.log("✓ shard building on a real converged shape produces valid, non-overlapping, complete coverage");
 }
 
 console.log("\nAll checks passed.");

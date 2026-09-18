@@ -17,3 +17,6 @@ export const GROUND_STROKE = "#4a3c2a";
 
 export const WEIGHT_COLOR = "#6b5a3a";
 export const WEIGHT_STROKE = "#392f1c";
+
+// The puff of debris a shard kicks up the instant it breaks.
+export const DUST_COLOR = "#b7ab94";
