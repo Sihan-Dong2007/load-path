@@ -21,6 +21,16 @@ import { reduceSystem } from "./web/src/boundary.js";
 import { solveLinearSystem } from "./web/src/linalg.js";
 import { runTopologyOptimization } from "./web/src/optimize.js";
 import { findConnectedPath } from "./web/src/connectivity.js";
+import {
+  kgToVolumeFraction,
+  volumeFractionToKg,
+  MAX_MATERIAL_KG,
+  kgToNewtons,
+  maxForceNewtons,
+  maxForceFromArea,
+  STONE_TENSILE_STRENGTH_PA,
+  GRAVITY_M_S2,
+} from "./web/src/units.js";
 
 const EPSILON = 1e-9;
 
@@ -430,6 +440,53 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   assert.ok(result !== null, "a solid row should be connected");
   assert.strictEqual(result.minDensity, 0.3, `minDensity should be the weakest cell (0.3), got ${result.minDensity}`);
   console.log("✓ minDensity picks out the weakest cell on the path, not the average");
+}
+
+// 16. Unit conversion: 100% material should be MAX_MATERIAL_KG, and the
+// two directions should round-trip.
+{
+  assert.ok(Math.abs(MAX_MATERIAL_KG - 1560) < 1e-6, `MAX_MATERIAL_KG should be 1560, got ${MAX_MATERIAL_KG}`);
+  assert.ok(Math.abs(kgToVolumeFraction(MAX_MATERIAL_KG) - 1) < 1e-9, "100% of the max kg should be volume fraction 1");
+  const fraction = 0.4;
+  const kg = volumeFractionToKg(fraction);
+  assert.ok(Math.abs(kgToVolumeFraction(kg) - fraction) < 1e-9, "kg <-> volume fraction should round-trip");
+  console.log(`✓ unit conversion round-trips (100% = ${MAX_MATERIAL_KG}kg, 40% = ${kg.toFixed(1)}kg)`);
+}
+
+// 17. Force conversion: a 1kg mass should exert exactly g newtons, and a
+// fully-solid (density 1) member's capacity should be exactly
+// strength x width x depth with no reduction.
+{
+  assert.ok(Math.abs(kgToNewtons(1) - GRAVITY_M_S2) < 1e-9, "1kg should exert g newtons");
+  const widthM = 0.05;
+  const depthM = 0.3;
+  const expected = STONE_TENSILE_STRENGTH_PA * widthM * depthM;
+  assert.ok(
+    Math.abs(maxForceNewtons(1, widthM, depthM) - expected) < 1e-6,
+    "a fully solid member's capacity should be strength * area with no reduction"
+  );
+  assert.ok(
+    Math.abs(maxForceNewtons(0.5, widthM, depthM) - expected / 2) < 1e-6,
+    "half density should carry half the force"
+  );
+  console.log("✓ force conversion is linear in mass and in density, as expected");
+}
+
+// 18. Area-based capacity: a strut with twice the total material over the
+// same length should have exactly twice the capacity — this is the
+// property maxForceNewtons (single weakest cell) can't provide, since
+// SIMP pushes density to near-0-or-1 regardless of material budget.
+{
+  const cellWidthM = 0.1;
+  const depthM = 0.3;
+  const gridLength = 5;
+  const thin = maxForceFromArea(5, cellWidthM, gridLength, depthM); // 5 cells' worth of density
+  const thick = maxForceFromArea(10, cellWidthM, gridLength, depthM); // 10 cells' worth
+  assert.ok(Math.abs(thick - 2 * thin) < 1e-6, `doubling total density should double capacity, got thin=${thin} thick=${thick}`);
+
+  const expectedThin = STONE_TENSILE_STRENGTH_PA * ((5 * cellWidthM) / gridLength) * depthM;
+  assert.ok(Math.abs(thin - expectedThin) < 1e-3, `capacity should match strength * avgWidth * depth, got ${thin} vs ${expectedThin}`);
+  console.log("✓ area-based capacity scales with total material, not just one cell's density");
 }
 
 console.log("\nAll checks passed.");

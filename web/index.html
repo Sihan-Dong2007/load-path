@@ -12,16 +12,23 @@
     overflow: hidden;
   }
   #tray {
-    height: 80px;
+    min-height: 96px;
+    padding: 10px 24px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+  }
+  #tray-row {
     display: flex;
     align-items: center;
-    padding: 0 24px;
-    box-sizing: border-box;
+    flex-wrap: wrap;
+    gap: 20px;
   }
   #tray-label {
     color: #8fa3bf;
     font: 14px system-ui, sans-serif;
-    margin-right: 16px;
   }
   #load-handle {
     width: 40px;
@@ -30,25 +37,56 @@
     border-radius: 6px;
     cursor: grab;
     touch-action: none;
+    flex-shrink: 0;
   }
   #load-handle.dragging {
     position: fixed;
     z-index: 10;
     cursor: grabbing;
   }
+  #material-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #8fa3bf;
+    font: 14px system-ui, sans-serif;
+  }
+  #material-label {
+    color: #e6edf7;
+    min-width: 3.5em;
+  }
+  #message {
+    color: #e6edf7;
+    font: 14px system-ui, sans-serif;
+    min-height: 1.2em;
+  }
   canvas {
     display: block;
     width: 100vw;
-    height: calc(100vh - 80px);
+    height: calc(100vh - 96px);
   }
 </style>
 </head>
 <body>
 <div id="tray">
-  <span id="tray-label">Drag the weight onto the structure:</span>
-  <div id="load-handle"></div>
+  <div id="tray-row">
+    <span id="tray-label">Drag the weight onto the structure:</span>
+    <div id="load-handle"></div>
+    <label id="material-control">
+      Stone (kg):
+      <input type="range" id="material-slider" min="230" max="1250" step="10" value="620">
+      <span id="material-label">620 kg</span>
+    </label>
+    <label id="material-control">
+      Test weight (kg):
+      <input type="range" id="weight-slider" min="5000" max="150000" step="1000" value="40000">
+      <span id="weight-label">40000 kg</span>
+    </label>
+  </div>
+  <div id="message"></div>
 </div>
 <canvas id="stage" width="1200" height="600"></canvas>
+<script src="vendor/matter.min.js"></script>
 <script type="module" src="src/main.js"></script>
 </body>
 </html>
