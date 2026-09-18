@@ -1,6 +1,6 @@
 import { nodeId, nodeDofs } from "./mesh.js";
 import { iterateTopologyOptimization } from "./optimize.js";
-import { renderDensities } from "./render.js";
+import { renderDensities, drawGround } from "./render.js";
 import { buildCollapseScene } from "./collapse.js";
 import { kgToVolumeFraction } from "./units.js";
 
@@ -15,6 +15,13 @@ const fixedDofs = [...nodeDofs(bottomLeft), ...nodeDofs(bottomRight)];
 
 const canvas = document.getElementById("stage");
 const ctx = canvas.getContext("2d");
+
+// The structural domain only fills the upper part of the canvas — the
+// bottom strip is a riverbank/canyon floor, painted here and real (as a
+// static Matter body) during the collapse scene, so debris that breaks
+// free has somewhere to visibly land instead of falling off-canvas.
+const GROUND_BAND_PX = 80;
+const domainHeight = canvas.height - GROUND_BAND_PX;
 const materialSlider = document.getElementById("material-slider");
 const materialLabel = document.getElementById("material-label");
 const weightSlider = document.getElementById("weight-slider");
@@ -96,7 +103,8 @@ function runFullCycle(loadColumn) {
     const { value, done } = iterator.next();
     if (done) return;
 
-    renderDensities(ctx, value.densities, canvas.width, canvas.height);
+    renderDensities(ctx, value.densities, canvas.width, domainHeight);
+    drawGround(ctx, canvas.width, domainHeight, canvas.height);
 
     if (!value.converged) {
       requestAnimationFrame(step);
@@ -116,7 +124,7 @@ function startCollapseTest(token, densities, u, loadColumn, materialKg) {
   lastMaterialKg = materialKg;
 
   const testWeightKg = getWeightKg();
-  const scene = buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas });
+  const scene = buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas, domainHeight });
   if (!scene.ok) {
     setMessage(`${materialKg}kg of stone can't even form a structure here — try more stone, or a different spot.`);
     return;
@@ -158,7 +166,8 @@ function retest() {
 // Idle until the first drop — a plain solid block, nothing computed yet.
 // Dropping the weight is what starts anything at all.
 const solidBlock = Array.from({ length: numElemY }, () => new Array(numElemX).fill(1));
-renderDensities(ctx, solidBlock, canvas.width, canvas.height);
+renderDensities(ctx, solidBlock, canvas.width, domainHeight);
+drawGround(ctx, canvas.width, domainHeight, canvas.height);
 setMessage("Drag the weight onto the block to begin.");
 
 materialSlider.addEventListener("input", updateLabels);

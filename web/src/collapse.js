@@ -1,4 +1,15 @@
 import { evaluateHalves } from "./failure.js";
+import {
+  SKY_COLOR,
+  STONE_COLOR,
+  STONE_STROKE,
+  BROKEN_STONE_COLOR,
+  BROKEN_STONE_STROKE,
+  GROUND_COLOR,
+  GROUND_STROKE,
+  WEIGHT_COLOR,
+  WEIGHT_STROKE,
+} from "./theme.js";
 
 const { Engine, Render, Runner, Bodies, Body, Composite, Vector } = window.Matter;
 
@@ -24,19 +35,32 @@ const MAX_FRAMES = 600; // ~10s safety cap in case something never quite settles
 // there's nothing to test, so the caller should treat that as an
 // automatic failure without spawning any physics. Otherwise returns an
 // object with dropBall()/hasSettled()/collapsed()/stop().
-export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas }) {
+export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas, domainHeight }) {
   const evaluation = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg });
   if (!evaluation.ok) return { ok: false };
 
   const canvasWidth = canvas.width;
   const canvasHeight = canvas.height;
   const cellWidth = canvasWidth / numElemX;
-  const cellHeight = canvasHeight / numElemY;
+  const cellHeight = domainHeight / numElemY;
   const physicsX = (elx) => elx * cellWidth + cellWidth / 2;
-  const physicsY = (ely) => canvasHeight - (ely * cellHeight + cellHeight / 2); // flip: ely up == y down
+  const physicsY = (ely) => domainHeight - (ely * cellHeight + cellHeight / 2); // flip: ely up == y down
 
   const engine = Engine.create();
   const world = engine.world;
+
+  // Riverbank/canyon floor the bridge spans — real (collidable) here, unlike
+  // the painted copy drawn during the growth animation, so debris that
+  // breaks free has somewhere to land instead of falling off-canvas.
+  const groundThickness = canvasHeight - domainHeight;
+  Composite.add(
+    world,
+    Bodies.rectangle(canvasWidth / 2, domainHeight + groundThickness / 2, canvasWidth * 1.4, groundThickness, {
+      isStatic: true,
+      friction: 0.9,
+      render: { fillStyle: GROUND_COLOR, strokeStyle: GROUND_STROKE, lineWidth: 2 },
+    })
+  );
 
   function buildBody(half) {
     const bottomX = physicsX(half.bottomCell.elx);
@@ -56,7 +80,10 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     // A bit longer than the true support-to-apex distance so the two
     // beams' tips overlap at the top, giving a dropped weight a solid
     // surface to land on. High friction so it settles where it lands.
-    const body = Bodies.rectangle(centerX, centerY, length + overlap, thickness, { friction: 0.9 });
+    const body = Bodies.rectangle(centerX, centerY, length + overlap, thickness, {
+      friction: 0.9,
+      render: { fillStyle: STONE_COLOR, strokeStyle: STONE_STROKE, lineWidth: 2 },
+    });
     Body.setAngle(body, angle);
     body.collisionFilter.group = -1; // the two beams overlap by design near the apex
     Body.setStatic(body, true);
@@ -78,23 +105,33 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     friction: 0.9,
     restitution: 0.1,
     isStatic: true, // starts suspended — "the weight resting where you placed it"
+    render: { fillStyle: WEIGHT_COLOR, strokeStyle: WEIGHT_STROKE, lineWidth: 2 },
   });
   Composite.add(world, testBall);
+
+  // Beyond animating the fall, breaking also recolors a beam to a duller,
+  // dustier stone tone — a second, non-motion cue that this is the piece
+  // the physics decided would fail.
+  function markBroken(body) {
+    Body.setStatic(body, false);
+    body.render.fillStyle = BROKEN_STONE_COLOR;
+    body.render.strokeStyle = BROKEN_STONE_STROKE;
+  }
 
   const { Events } = window.Matter;
   Events.on(engine, "collisionStart", (event) => {
     for (const pair of event.pairs) {
       const bodies = [pair.bodyA, pair.bodyB];
       if (!bodies.includes(testBall)) continue;
-      if (bodies.includes(leftBody) && leftBody.isStatic && willBreak.left) Body.setStatic(leftBody, false);
-      if (bodies.includes(rightBody) && rightBody.isStatic && willBreak.right) Body.setStatic(rightBody, false);
+      if (bodies.includes(leftBody) && leftBody.isStatic && willBreak.left) markBroken(leftBody);
+      if (bodies.includes(rightBody) && rightBody.isStatic && willBreak.right) markBroken(rightBody);
     }
   });
 
   const render = Render.create({
     canvas,
     engine,
-    options: { width: canvasWidth, height: canvasHeight, wireframes: false, background: "#0b1320" },
+    options: { width: canvasWidth, height: canvasHeight, wireframes: false, background: SKY_COLOR },
   });
   const runner = Runner.create();
 
