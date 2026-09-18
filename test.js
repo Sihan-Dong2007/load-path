@@ -25,7 +25,8 @@ import { computeStrain, planeStressD, computeStress, principalStresses, maxPrinc
 import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from "./web/src/buckling.js";
 import { evaluateHalves } from "./web/src/failure.js";
 import { convexHull, polygonCentroid, groupCellsBySeed, buildShards } from "./web/src/fracture.js";
-import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2 } from "./web/src/units.js";
+import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2, stressScaleFactor, BRIDGE_DEPTH_M } from "./web/src/units.js";
+import { elementDofs } from "./web/src/mesh.js";
 
 const EPSILON = 1e-9;
 
@@ -736,6 +737,38 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   }
   assert.equal(seen.size, cells.length, "shards together must account for every solid cell exactly once");
   console.log("✓ shard building on a real converged shape produces valid, non-overlapping, complete coverage");
+}
+
+// 29. Real-unit stress scaling, checked against a textbook case: a uniform
+// bar under total axial force F has stress F / (thickness * height). The
+// FEM runs in unit-model units, so model stress x F x stressScaleFactor(h)
+// must reproduce that in pascals. This is the test that would have caught
+// the missing 1/(t*h) factor (~100x for the real bridge) the strength
+// check originally had — none of the other tests touched absolute stress.
+{
+  const nx = 8;
+  const ny = 4;
+  const cellSizeM = 0.05; // real element size
+  const forceN = 1000;
+
+  const densities = solidDensities(nx, ny);
+  const fixed = [];
+  for (let r = 0; r <= ny; r++) fixed.push(...nodeDofs(nodeId(0, r, nx)));
+  const loads = [];
+  for (let r = 0; r <= ny; r++) {
+    const share = r === 0 || r === ny ? 0.5 : 1; // consistent nodal loads on the end edge
+    loads.push([nodeDofs(nodeId(nx, r, nx))[0], share / ny]);
+  }
+  const u = solveDisplacement(nx, ny, densities, fixed, loads);
+  const u_e = elementDofs(nx / 2, ny / 2, nx).map((d) => u[d]);
+
+  const realStressPa = maxPrincipalStress(u_e, 1, 0.3) * forceN * stressScaleFactor(cellSizeM);
+  const textbookPa = forceN / (BRIDGE_DEPTH_M * ny * cellSizeM);
+  assert.ok(
+    Math.abs(realStressPa - textbookPa) / textbookPa < 0.01,
+    `real stress should match F/(t*H)=${textbookPa.toFixed(1)} Pa within 1%, got ${realStressPa.toFixed(1)} Pa`
+  );
+  console.log(`✓ real-unit stress matches the textbook F/(t·H) for a uniform bar (${realStressPa.toFixed(0)} Pa vs ${textbookPa.toFixed(0)} Pa)`);
 }
 
 console.log("\nAll checks passed.");

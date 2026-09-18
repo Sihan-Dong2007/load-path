@@ -44,7 +44,29 @@ export function volumeFractionToKg(fraction) {
 
 export const GRAVITY_M_S2 = 9.8;
 
+// The test-weight range worth offering, as powers of ten of kg. Found with
+// sweep.js after the stress scaling was corrected: below ~10^4 kg every
+// shape holds, above ~10^6 kg every shape breaks, and the interesting
+// middle (outcome depends on stone budget and where the weight lands)
+// sits in between. Shared by the slider (main.js) and the impact
+// sound/dust intensity (collapse.js) so they can't drift apart.
+export const WEIGHT_EXPONENT_MIN = 3;
+export const WEIGHT_EXPONENT_MAX = 6;
+
 // Real force (newtons) a real mass exerts under gravity.
 export function kgToNewtons(kg) {
   return kg * GRAVITY_M_S2;
+}
+
+// The FEM model is a unit model: elements are 1 x 1 and the plate is 1
+// thick, so a stress it reports (with E=1 and a unit load) is really
+// "stress per unit force, for a plate of thickness 1 and element size 1".
+// For a real plate of thickness t and element size h, stress scales as
+// F / (t * h) — e.g. a uniform bar under total force F has stress
+// F / (t * H), and the model reports exactly 1/H for F=1, t=1. Multiply a
+// model stress by (real force) x stressScaleFactor(h) to get pascals.
+// Skipping this factor (an earlier version did) understates every real
+// stress by 1 / (t * h) — about 100x for this bridge.
+export function stressScaleFactor(cellSizeM) {
+  return 1 / (BRIDGE_DEPTH_M * cellSizeM);
 }

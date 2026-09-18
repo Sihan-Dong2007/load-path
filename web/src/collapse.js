@@ -2,6 +2,7 @@ import { evaluateHalves } from "./failure.js";
 import { buildShards, polygonCentroid } from "./fracture.js";
 import { createDustSystem } from "./dust.js";
 import { playImpact, playBreak } from "./sound.js";
+import { WEIGHT_EXPONENT_MIN, WEIGHT_EXPONENT_MAX } from "./units.js";
 import {
   SKY_COLOR,
   STONE_COLOR,
@@ -26,7 +27,12 @@ const MAX_FRAMES = 600; // ~10s safety cap in case something never quite settles
 // including neighboring shards within the same half.
 const SHARD_GROUP = -1;
 const MIN_SHARDS = 3;
-const MAX_SHARDS = 7;
+// High enough that CELLS_PER_SHARD_TARGET is the one actually deciding
+// shard count across the real material range (roughly 230-1560kg, i.e.
+// ~230-865 solid cells per half) -- an earlier MAX_SHARDS=7 sat below the
+// uncapped count everywhere in that range, so every structure shattered
+// into exactly 7 pieces per half regardless of how much material it had.
+const MAX_SHARDS = 20;
 const CELLS_PER_SHARD_TARGET = 25;
 
 function shardCountFor(cellCount) {
@@ -146,10 +152,13 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
   const dust = createDustSystem(render);
 
   // How hard the drop reads, for both the audio and the dust: derived from
-  // the same real-unit exponent range main.js maps the weight slider onto
-  // (10^5 - 10^8 kg), so a heavier test weight sounds and looks heavier,
-  // not just "breaks or doesn't."
-  const impactIntensity = Math.min(1, Math.max(0, (Math.log10(testWeightKg) - 5) / 3));
+  // the same exponent range main.js maps the weight slider onto, so a
+  // heavier test weight sounds and looks heavier, not just "breaks or
+  // doesn't."
+  const impactIntensity = Math.min(
+    1,
+    Math.max(0, (Math.log10(testWeightKg) - WEIGHT_EXPONENT_MIN) / (WEIGHT_EXPONENT_MAX - WEIGHT_EXPONENT_MIN))
+  );
 
   // Beyond animating the fall, breaking also recolors every shard in that
   // half to a duller, dustier stone tone and kicks up a dust puff at each
@@ -165,9 +174,19 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     }
   }
 
-  // The first ball-structure contact always gets an impact thud, whether or
-  // not anything ends up breaking; a half's own break sound plays on top of
-  // that, once, the moment it's triggered.
+  function releaseShards(shards) {
+    for (const body of shards) Body.setStatic(body, false);
+  }
+
+  // evaluateHalves resolves both halves' fates from ONE simultaneous
+  // application of the load (real 2D truss statics, splitting the same
+  // force across both sides at once) — so the moment the ball actually
+  // reaches the structure, both verdicts are already decided together,
+  // not one at a time as the ball happens to bump into each side. Waiting
+  // for a separate contact per half would let a half the physics already
+  // called a failure sit there forever untouched, if the ball's landing
+  // spot just never happened to reach it — an inconsistency between what
+  // was computed and what's shown, not a different physical outcome.
   let hasImpacted = false;
 
   const { Events } = window.Matter;
@@ -175,20 +194,28 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     for (const pair of event.pairs) {
       const bodies = [pair.bodyA, pair.bodyB];
       if (!bodies.includes(testBall)) continue;
+      const touchedStructure = bodies.some((b) => leftShards.includes(b) || rightShards.includes(b));
+      if (hasImpacted || !touchedStructure) continue;
 
-      if (!hasImpacted) {
-        hasImpacted = true;
-        playImpact(impactIntensity);
-      }
-      if (!triggered.left && willBreak.left && bodies.some((b) => leftShards.includes(b))) {
+      hasImpacted = true;
+      playImpact(impactIntensity);
+      if (willBreak.left) {
         triggered.left = true;
         markBroken(leftShards);
-        playBreak(impactIntensity);
       }
-      if (!triggered.right && willBreak.right && bodies.some((b) => rightShards.includes(b))) {
+      if (willBreak.right) {
         triggered.right = true;
         markBroken(rightShards);
+      }
+      if (triggered.left || triggered.right) {
         playBreak(impactIntensity);
+        // The two halves prop each other up at the apex, so once either
+        // one fails the other has lost its support too — leaving it
+        // frozen in mid-air (as an earlier version did) shows a structure
+        // that couldn't actually stand. Release it without recoloring, so
+        // the dark shards still mark which side actually failed.
+        if (!triggered.left) releaseShards(leftShards);
+        if (!triggered.right) releaseShards(rightShards);
       }
     }
   });

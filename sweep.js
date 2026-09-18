@@ -44,7 +44,7 @@ const positions = {
 };
 
 const materials = [250, 400, 620, 900, 1200];
-const weights = [500000, 1000000, 3000000, 6000000, 10000000, 20000000, 40000000, 80000000];
+const weights = [2000, 5000, 10000, 30000, 100000, 300000, 1000000, 3000000, 10000000];
 
 for (const materialKg of materials) {
   const shapes = {};

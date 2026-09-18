@@ -2,7 +2,7 @@ import { findConnectedPath } from "./connectivity.js";
 import { elementDofs } from "./mesh.js";
 import { maxPrincipalStress } from "./stress.js";
 import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from "./buckling.js";
-import { kgToNewtons, STONE_TENSILE_STRENGTH_PA, STONE_ELASTIC_MODULUS_PA, BRIDGE_SPAN_M, BRIDGE_RISE_M, BRIDGE_DEPTH_M } from "./units.js";
+import { kgToNewtons, stressScaleFactor, STONE_TENSILE_STRENGTH_PA, STONE_ELASTIC_MODULUS_PA, BRIDGE_SPAN_M, BRIDGE_RISE_M, BRIDGE_DEPTH_M } from "./units.js";
 
 const DENSITY_THRESHOLD = 0.5;
 
@@ -53,11 +53,12 @@ export function halfGeometry(numElemX, numElemY, densities, columnFilter, suppor
 // The worst (highest stress-to-capacity ratio) element anywhere in this
 // half's real, irregular material — a true per-point check, not an
 // average, so a local pinch point can't be hidden by wider material
-// elsewhere. Units: maxPrincipalStress is computed with E=1, which (see
-// stress.js / units.js) means it's real stress PER NEWTON of real applied
-// force — dividing by capacity (a fixed real value in Pa) gives a ratio
-// in 1/newtons; multiplying that by the real applied force elsewhere
-// gives back a plain dimensionless ratio, >1 meaning failure.
+// elsewhere. Units: maxPrincipalStress is computed with E=1 in the unit
+// model (element size 1, thickness 1), so it's stress per unit force in
+// MODEL units — dividing by capacity (Pa) gives a ratio that the caller
+// turns into a real, dimensionless one by multiplying by the real force
+// (N) AND stressScaleFactor (1 / (thickness x element size), see
+// units.js). >1 means failure.
 function worstStressToCapacityRatio(numElemX, densities, u, cells) {
   let worst = 0;
   for (const cell of cells) {
@@ -97,7 +98,8 @@ export function evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, t
   const axial = resolveTrussAxialForces(left.angle, right.angle, appliedForceN);
 
   function evaluateOne(half, axialForceN) {
-    const stressRatio = worstStressToCapacityRatio(numElemX, densities, u, half.cells) * appliedForceN;
+    const stressRatio =
+      worstStressToCapacityRatio(numElemX, densities, u, half.cells) * appliedForceN * stressScaleFactor(half.cellWidthM);
     const strengthFails = stressRatio > 1;
 
     const totalDensitySum = half.cells.reduce((sum, cell) => sum + densities[cell.ely][cell.elx], 0);

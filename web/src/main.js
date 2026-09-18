@@ -2,7 +2,7 @@ import { nodeId, nodeDofs } from "./mesh.js";
 import { iterateTopologyOptimization } from "./optimize.js";
 import { renderDensities, drawGround } from "./render.js";
 import { buildCollapseScene } from "./collapse.js";
-import { kgToVolumeFraction } from "./units.js";
+import { kgToVolumeFraction, WEIGHT_EXPONENT_MIN, WEIGHT_EXPONENT_MAX } from "./units.js";
 
 // Supports stay fixed at the two bottom corners — only the load point and
 // the material budget are interactive.
@@ -33,13 +33,10 @@ function getMaterialKg() {
   return Number(materialSlider.value);
 }
 
-// A real stone bridge this size turns out to be enormously strong — the
-// sweep in sweep.js found the interesting range (some positions hold,
-// some don't) spans roughly 10^5 to 10^8 kg, not a range a linear slider
-// can usefully cover. The slider itself stays a plain 0-1000 range;
-// this maps that onto the real exponent range.
-const WEIGHT_EXPONENT_MIN = 5; // 10^5 kg = 100,000 kg
-const WEIGHT_EXPONENT_MAX = 8; // 10^8 kg = 100,000,000 kg
+// The interesting range (some shapes hold, some don't, depending on stone
+// and position) spans several orders of magnitude (see WEIGHT_EXPONENT_*
+// in units.js), which a linear slider can't usefully cover. The slider
+// itself stays a plain 0-1000 range; this maps it onto that exponent range.
 const WEIGHT_SLIDER_MAX = 1000;
 
 function getWeightKg() {
@@ -48,14 +45,21 @@ function getWeightKg() {
   return Math.round(10 ** exponent);
 }
 
-// Numbers in the hundred-thousands to hundred-millions don't mean much on
-// their own — anchoring to a real, visualizable object's weight (a fully
-// loaded Boeing 747, ~400,000kg) makes them legible.
-const BOEING_747_KG = 400000;
+// Bare kilogram counts don't mean much — anchor each to the nearest (on a
+// log scale) familiar object. Approximate, round-number masses.
+const REFERENCE_OBJECTS = [
+  { name: "a car", kg: 1500 },
+  { name: "an elephant", kg: 6000 },
+  { name: "a loaded semi-truck", kg: 36000 },
+  { name: "a loaded Boeing 747", kg: 400000 },
+];
 function formatWeightKg(kg) {
-  const planes = kg / BOEING_747_KG;
-  const planesText = planes < 10 ? planes.toFixed(1) : Math.round(planes).toLocaleString();
-  return `${Math.round(kg).toLocaleString()} kg (≈ ${planesText} × a loaded Boeing 747)`;
+  const nearest = REFERENCE_OBJECTS.reduce((best, obj) =>
+    Math.abs(Math.log(kg / obj.kg)) < Math.abs(Math.log(kg / best.kg)) ? obj : best
+  );
+  const count = kg / nearest.kg;
+  const countText = count < 10 ? count.toFixed(1) : Math.round(count).toLocaleString();
+  return `${Math.round(kg).toLocaleString()} kg (≈ ${countText} × ${nearest.name})`;
 }
 
 function setMessage(text) {
