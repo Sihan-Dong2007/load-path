@@ -23,6 +23,11 @@ export const BRIDGE_DEPTH_M = 0.3; // the bridge's actual width, i.e. the
 // actually take.
 export const STONE_DENSITY_KG_M3 = 2600;
 export const STONE_TENSILE_STRENGTH_PA = 5e6; // 5 MPa
+// Needed specifically for buckling — unlike the strength check, buckling
+// resistance depends on how STIFF a member is (E), not just how strong it
+// is, so this is a genuinely new physical constant, not a restatement of
+// the tensile strength above. A representative value for granite/limestone.
+export const STONE_ELASTIC_MODULUS_PA = 3e10; // 30 GPa
 
 export const BRIDGE_VOLUME_M3 = BRIDGE_SPAN_M * BRIDGE_RISE_M * BRIDGE_DEPTH_M;
 
@@ -42,36 +47,4 @@ export const GRAVITY_M_S2 = 9.8;
 // Real force (newtons) a real mass exerts under gravity.
 export function kgToNewtons(kg) {
   return kg * GRAVITY_M_S2;
-}
-
-// The real force (newtons) a member can carry before its weakest point
-// fails: tensile strength x cross-sectional area, where the area is that
-// point's real width (a grid cell's real size, in meters) x the bridge's
-// real depth x how filled that cell actually is (minDensity — SIMP's own
-// density already represents a fraction of solid material, so a half-dense
-// cell is treated as carrying half the force a fully solid one would).
-//
-// NOTE: this treats "one weakest cell" as the whole cross-section, which
-// undersells a strut that got WIDER from more material budget — SIMP
-// converges to near-binary (0 or 1) density almost everywhere, so more
-// material mostly means more solid cells side-by-side, not a stronger
-// single cell. Kept for cases (tests, simple examples) that only have a
-// single-cell-wide member to reason about; maxForceFromArea below is the
-// one that actually responds to material budget for a real strut.
-export function maxForceNewtons(minDensity, widthM, depthM = BRIDGE_DEPTH_M) {
-  const area = widthM * depthM * minDensity;
-  return STONE_TENSILE_STRENGTH_PA * area;
-}
-
-// Capacity from a strut's total material instead of one weak point:
-// average cross-section = total (density-weighted) area / real length.
-// This is what actually responds to material budget — a strut built
-// wider (more parallel solid cells, from a bigger volume fraction) gets a
-// bigger average width and so a higher capacity, which a single cell's
-// density can't reflect since SIMP pushes density to near-0-or-1 almost
-// everywhere regardless of how much total material it had to work with.
-export function maxForceFromArea(totalDensitySum, cellWidthM, gridLength, depthM = BRIDGE_DEPTH_M) {
-  const avgWidthM = (totalDensitySum * cellWidthM) / gridLength;
-  const area = avgWidthM * depthM;
-  return STONE_TENSILE_STRENGTH_PA * area;
 }

@@ -21,16 +21,10 @@ import { reduceSystem } from "./web/src/boundary.js";
 import { solveLinearSystem } from "./web/src/linalg.js";
 import { runTopologyOptimization } from "./web/src/optimize.js";
 import { findConnectedPath } from "./web/src/connectivity.js";
-import {
-  kgToVolumeFraction,
-  volumeFractionToKg,
-  MAX_MATERIAL_KG,
-  kgToNewtons,
-  maxForceNewtons,
-  maxForceFromArea,
-  STONE_TENSILE_STRENGTH_PA,
-  GRAVITY_M_S2,
-} from "./web/src/units.js";
+import { computeStrain, planeStressD, computeStress, principalStresses, maxPrincipalStress } from "./web/src/stress.js";
+import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from "./web/src/buckling.js";
+import { evaluateHalves } from "./web/src/failure.js";
+import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2 } from "./web/src/units.js";
 
 const EPSILON = 1e-9;
 
@@ -453,40 +447,176 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   console.log(`✓ unit conversion round-trips (100% = ${MAX_MATERIAL_KG}kg, 40% = ${kg.toFixed(1)}kg)`);
 }
 
-// 17. Force conversion: a 1kg mass should exert exactly g newtons, and a
-// fully-solid (density 1) member's capacity should be exactly
-// strength x width x depth with no reduction.
+// 17. Force conversion: a 1kg mass should exert exactly g newtons.
 {
   assert.ok(Math.abs(kgToNewtons(1) - GRAVITY_M_S2) < 1e-9, "1kg should exert g newtons");
-  const widthM = 0.05;
-  const depthM = 0.3;
-  const expected = STONE_TENSILE_STRENGTH_PA * widthM * depthM;
-  assert.ok(
-    Math.abs(maxForceNewtons(1, widthM, depthM) - expected) < 1e-6,
-    "a fully solid member's capacity should be strength * area with no reduction"
-  );
-  assert.ok(
-    Math.abs(maxForceNewtons(0.5, widthM, depthM) - expected / 2) < 1e-6,
-    "half density should carry half the force"
-  );
-  console.log("✓ force conversion is linear in mass and in density, as expected");
+  console.log("✓ force conversion is linear in mass, as expected");
 }
 
-// 18. Area-based capacity: a strut with twice the total material over the
-// same length should have exactly twice the capacity — this is the
-// property maxForceNewtons (single weakest cell) can't provide, since
-// SIMP pushes density to near-0-or-1 regardless of material budget.
+// 18. Strain recovery: a displacement field that's a uniform stretch in x
+// (u = 0.1*x, v = 0) should give exactly epsilon_x=0.1 and nothing else —
+// hand-computed from the node positions, not just re-deriving the B
+// matrix's own formula.
 {
-  const cellWidthM = 0.1;
-  const depthM = 0.3;
-  const gridLength = 5;
-  const thin = maxForceFromArea(5, cellWidthM, gridLength, depthM); // 5 cells' worth of density
-  const thick = maxForceFromArea(10, cellWidthM, gridLength, depthM); // 10 cells' worth
-  assert.ok(Math.abs(thick - 2 * thin) < 1e-6, `doubling total density should double capacity, got thin=${thin} thick=${thick}`);
+  // Nodes: bottom-left(0,0), bottom-right(1,0), top-right(1,1), top-left(0,1).
+  const stretch_u_e = [0, 0, 0.1, 0, 0.1, 0, 0, 0]; // u=0.1x, v=0 at each corner
+  const strain = computeStrain(stretch_u_e);
+  assert.ok(Math.abs(strain[0] - 0.1) < 1e-9, `epsilon_x should be 0.1, got ${strain[0]}`);
+  assert.ok(Math.abs(strain[1]) < 1e-9, `epsilon_y should be 0, got ${strain[1]}`);
+  assert.ok(Math.abs(strain[2]) < 1e-9, `gamma_xy should be 0, got ${strain[2]}`);
 
-  const expectedThin = STONE_TENSILE_STRENGTH_PA * ((5 * cellWidthM) / gridLength) * depthM;
-  assert.ok(Math.abs(thin - expectedThin) < 1e-3, `capacity should match strength * avgWidth * depth, got ${thin} vs ${expectedThin}`);
-  console.log("✓ area-based capacity scales with total material, not just one cell's density");
+  // A different field, v = 0.2*x, u = 0, is pure shear: gamma_xy = du/dy +
+  // dv/dx = 0 + 0.2 = 0.2, with no normal strain at all.
+  const shear_u_e = [0, 0, 0, 0.2, 0, 0.2, 0, 0];
+  const shearStrain = computeStrain(shear_u_e);
+  assert.ok(Math.abs(shearStrain[0]) < 1e-9 && Math.abs(shearStrain[1]) < 1e-9, "pure shear field should have no normal strain");
+  assert.ok(Math.abs(shearStrain[2] - 0.2) < 1e-9, `gamma_xy should be 0.2, got ${shearStrain[2]}`);
+  console.log("✓ strain recovery matches hand-computed values for uniform stretch and pure shear");
+}
+
+// 19. Plane-stress Hooke's law: D must match the textbook formula exactly
+// (this is a regression check on the matrix entries themselves, not an
+// independent derivation).
+{
+  const E = 1;
+  const nu = 0.3;
+  const D = planeStressD(E, nu);
+  const scale = E / (1 - nu * nu);
+  assert.ok(Math.abs(D[0][0] - scale) < 1e-9, "D[0][0] should be E/(1-nu^2)");
+  assert.ok(Math.abs(D[0][1] - scale * nu) < 1e-9, "D[0][1] should be nu*E/(1-nu^2)");
+  assert.ok(Math.abs(D[2][2] - (scale * (1 - nu)) / 2) < 1e-9, "D[2][2] should be the shear modulus term");
+
+  const strain = [0.1, 0, 0];
+  const [sx, sy, txy] = computeStress(strain, D);
+  assert.ok(Math.abs(sx - scale * 0.1) < 1e-9, "uniaxial strain should give sigma_x = scale * epsilon_x");
+  assert.ok(Math.abs(sy - scale * nu * 0.1) < 1e-9, "plane stress Poisson coupling should give a nonzero sigma_y, not 0");
+  assert.ok(Math.abs(txy) < 1e-9, "no shear strain should mean no shear stress");
+  console.log("✓ plane-stress D matrix matches Hooke's law, including the Poisson coupling term");
+}
+
+// 20. Principal stresses: hand-checkable Mohr's-circle cases.
+{
+  const [s1a, s2a] = principalStresses(3, 1, 0);
+  assert.ok(Math.abs(s1a - 3) < 1e-9 && Math.abs(s2a - 1) < 1e-9, "with no shear, principal stresses are just sigma_x and sigma_y");
+
+  const [s1b, s2b] = principalStresses(1, 1, 1);
+  assert.ok(Math.abs(s1b - 2) < 1e-9 && Math.abs(s2b - 0) < 1e-9, `expected [2,0], got [${s1b},${s2b}]`);
+  console.log("✓ principal stresses match hand-computed Mohr's-circle values");
+}
+
+// 21. End-to-end: maxPrincipalStress on the uniform-stretch case should
+// equal scale * 0.1 (since that strain state has no shear, sigma_x is
+// already the max principal stress).
+{
+  const E = 1;
+  const nu = 0.3;
+  const stretch_u_e = [0, 0, 0.1, 0, 0.1, 0, 0, 0];
+  const expected = (E / (1 - nu * nu)) * 0.1;
+  const s1 = maxPrincipalStress(stretch_u_e, E, nu);
+  assert.ok(Math.abs(s1 - expected) < 1e-9, `maxPrincipalStress should be ${expected}, got ${s1}`);
+  console.log("✓ maxPrincipalStress matches the hand-computed value end-to-end");
+}
+
+// 22. Moment of inertia and Euler buckling load: check against the
+// textbook formula directly, and check the scaling relationships that
+// have to hold regardless of the exact numbers (doubling length should
+// cut the critical load to a quarter, since it's a length^2 term).
+{
+  const bend = 0.1;
+  const perp = 0.3;
+  const I = rectMomentOfInertia(bend, perp);
+  assert.ok(Math.abs(I - (perp * bend ** 3) / 12) < 1e-12, "moment of inertia should match perp * bend^3 / 12");
+
+  const E = 3e10;
+  const L = 1;
+  const Pcr = eulerCriticalLoad(E, I, L);
+  assert.ok(Math.abs(Pcr - (Math.PI ** 2 * E * I) / L ** 2) < 1e-3, "Euler load should match pi^2 EI / L^2");
+
+  const PcrDoubleLength = eulerCriticalLoad(E, I, L * 2);
+  assert.ok(Math.abs(PcrDoubleLength - Pcr / 4) < 1e-6, "doubling length should cut critical load to 1/4");
+
+  const PcrDoubleI = eulerCriticalLoad(E, 2 * I, L);
+  assert.ok(Math.abs(PcrDoubleI - Pcr * 2) < 1e-3, "doubling moment of inertia should double critical load");
+  console.log("✓ Euler buckling load matches the textbook formula and its scaling relationships");
+}
+
+// 23. Truss statics: a symmetric A-frame (45 degrees on each side) under a
+// central vertical load should split it as W/sqrt(2) compression in each
+// leg — a standard, hand-checkable statics result — and for an
+// asymmetric case, the solved forces must satisfy the original
+// equilibrium equations exactly (a general self-consistency check, not
+// tied to one specific hand-solved number).
+{
+  const W = 100;
+  const { left, right } = resolveTrussAxialForces(Math.PI / 4, (3 * Math.PI) / 4, W);
+  const expected = W / Math.sqrt(2);
+  assert.ok(Math.abs(left - expected) < 1e-9, `left should be W/sqrt(2)=${expected}, got ${left}`);
+  assert.ok(Math.abs(right - expected) < 1e-9, `right should be W/sqrt(2)=${expected}, got ${right}`);
+
+  const angleLeft = 0.5;
+  const angleRight = 2.3;
+  const forces = resolveTrussAxialForces(angleLeft, angleRight, W);
+  const horizontalSum = forces.left * Math.cos(angleLeft) + forces.right * Math.cos(angleRight);
+  const verticalSum = forces.left * Math.sin(angleLeft) + forces.right * Math.sin(angleRight);
+  assert.ok(Math.abs(horizontalSum) < 1e-6, `horizontal equilibrium should hold, got ${horizontalSum}`);
+  assert.ok(Math.abs(verticalSum - W) < 1e-6, `vertical equilibrium should sum to W, got ${verticalSum}`);
+  console.log("✓ truss statics matches the symmetric hand-solved case and satisfies equilibrium for an asymmetric one");
+}
+
+// 24. End-to-end failure evaluation on a real converged shape.
+{
+  const numElemX = 20;
+  const numElemY = 10;
+  const volumeFraction = 0.4;
+  const loadColumn = numElemX / 2;
+
+  const bottomLeft = nodeId(0, 0, numElemX);
+  const bottomRight = nodeId(numElemX, 0, numElemX);
+  const fixedDofs = [...nodeDofs(bottomLeft), ...nodeDofs(bottomRight)];
+  const node = nodeId(loadColumn, numElemY, numElemX);
+  const [, loadDof] = nodeDofs(node);
+  const loads = [[loadDof, -1]];
+
+  const { densities, u } = runTopologyOptimization(numElemX, numElemY, fixedDofs, loads, { volumeFraction });
+
+  // 25a. A trivially light weight should be reported connected and fine.
+  const light = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg: 1 });
+  assert.ok(light.ok, "the shape should be connected for this volume fraction");
+  assert.ok(!light.left.fails && !light.right.fails, "a 1kg test weight should not fail either side");
+
+  // 25b. Doubling the applied weight must exactly double the stress
+  // ratio — this is the actual mathematical claim behind skipping a real
+  // elastic modulus (stress scales linearly with applied force,
+  // independent of E, for a linear elastic solve) — not just a
+  // plausibility check.
+  const r1 = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg: 1000 });
+  const r2 = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg: 2000 });
+  assert.ok(
+    Math.abs(r2.left.stressRatio - 2 * r1.left.stressRatio) < 1e-6 * Math.max(1, r1.left.stressRatio),
+    `doubling the weight should double the stress ratio: ${r1.left.stressRatio} -> ${r2.left.stressRatio}`
+  );
+  assert.ok(
+    Math.abs(r2.right.stressRatio - 2 * r1.right.stressRatio) < 1e-6 * Math.max(1, r1.right.stressRatio),
+    "doubling the weight should double the right side's stress ratio too"
+  );
+
+  // 25c. Symmetric setup (centered load, symmetric supports) should give
+  // left and right nearly identical results.
+  assert.ok(
+    Math.abs(r1.left.stressRatio - r1.right.stressRatio) < 1e-6 * Math.max(1, r1.left.stressRatio),
+    `symmetric setup should give matching stress ratios, got ${r1.left.stressRatio} vs ${r1.right.stressRatio}`
+  );
+  assert.ok(
+    Math.abs(r1.left.axialForceN - r1.right.axialForceN) < 1e-6 * Math.max(1, r1.left.axialForceN),
+    "symmetric setup should give matching axial forces"
+  );
+
+  // 25d. Some large enough weight must eventually fail — otherwise the
+  // check could be vacuously always-true.
+  const heavy = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg: 1e9 });
+  assert.ok(heavy.left.fails && heavy.right.fails, "an absurdly heavy test weight must fail both sides");
+
+  console.log("✓ failure evaluation: stress ratio scales linearly with weight, is symmetric for a symmetric setup, and a heavy enough weight fails");
 }
 
 console.log("\nAll checks passed.");

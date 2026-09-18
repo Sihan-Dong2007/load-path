@@ -58,7 +58,16 @@ export function* iterateTopologyOptimization(numElemX, numElemY, fixedDofs, load
 
     densities = newDensities;
     const converged = maxChange < tolerance;
-    yield { densities, iteration: iteration + 1, compliance, maxChange, converged };
+
+    // u above was solved for the density BEFORE this iteration's update,
+    // not the newDensities being yielded now — fine for the animation
+    // (they're one step apart, visually indistinguishable), but stress
+    // recovery on the final shape needs u that actually matches the exact
+    // densities returned, so re-solve once, warm-started from u (cheap:
+    // density barely moved on the very last step).
+    const finalU = converged ? solveDisplacement(numElemX, numElemY, densities, fixedDofs, loads, { previousU: u }) : u;
+
+    yield { densities, iteration: iteration + 1, compliance, maxChange, converged, u: finalU };
 
     if (converged) return;
   }
@@ -80,6 +89,7 @@ export function runTopologyOptimization(numElemX, numElemY, fixedDofs, loads, op
     densities: last.densities,
     iterations: last.iteration,
     converged: last.converged,
+    u: last.u,
     history,
   };
 }

@@ -26,8 +26,29 @@ function getMaterialKg() {
   return Number(materialSlider.value);
 }
 
+// A real stone bridge this size turns out to be enormously strong — the
+// sweep in sweep.js found the interesting range (some positions hold,
+// some don't) spans roughly 10^5 to 10^8 kg, not a range a linear slider
+// can usefully cover. The slider itself stays a plain 0-1000 range;
+// this maps that onto the real exponent range.
+const WEIGHT_EXPONENT_MIN = 5; // 10^5 kg = 100,000 kg
+const WEIGHT_EXPONENT_MAX = 8; // 10^8 kg = 100,000,000 kg
+const WEIGHT_SLIDER_MAX = 1000;
+
 function getWeightKg() {
-  return Number(weightSlider.value);
+  const t = Number(weightSlider.value) / WEIGHT_SLIDER_MAX;
+  const exponent = WEIGHT_EXPONENT_MIN + (WEIGHT_EXPONENT_MAX - WEIGHT_EXPONENT_MIN) * t;
+  return Math.round(10 ** exponent);
+}
+
+// Numbers in the hundred-thousands to hundred-millions don't mean much on
+// their own — anchoring to a real, visualizable object's weight (a fully
+// loaded Boeing 747, ~400,000kg) makes them legible.
+const BOEING_747_KG = 400000;
+function formatWeightKg(kg) {
+  const planes = kg / BOEING_747_KG;
+  const planesText = planes < 10 ? planes.toFixed(1) : Math.round(planes).toLocaleString();
+  return `${Math.round(kg).toLocaleString()} kg (≈ ${planesText} × a loaded Boeing 747)`;
 }
 
 function setMessage(text) {
@@ -36,7 +57,7 @@ function setMessage(text) {
 
 function updateLabels() {
   materialLabel.textContent = `${materialSlider.value} kg`;
-  weightLabel.textContent = `${weightSlider.value} kg`;
+  weightLabel.textContent = formatWeightKg(getWeightKg());
 }
 updateLabels();
 
@@ -47,8 +68,9 @@ updateLabels();
 let currentRunToken = 0;
 let activeScene = null; // the physics scene from the current/most recent test, if any
 let lastLoadColumn = null; // set on the first drop; nothing runs before that
-let lastDensities = null; // the last converged shape, cached so changing
-let lastMaterialKg = null; // just the test weight doesn't re-grow it
+let lastDensities = null; // the last converged shape and its displacement
+let lastU = null; // field, cached so changing just the test weight
+let lastMaterialKg = null; // doesn't re-grow the structure
 
 function runFullCycle(loadColumn) {
   const token = ++currentRunToken;
@@ -79,21 +101,22 @@ function runFullCycle(loadColumn) {
     if (!value.converged) {
       requestAnimationFrame(step);
     } else {
-      startCollapseTest(token, value.densities, loadColumn, materialKg);
+      startCollapseTest(token, value.densities, value.u, loadColumn, materialKg);
     }
   }
 
   requestAnimationFrame(step);
 }
 
-function startCollapseTest(token, densities, loadColumn, materialKg) {
+function startCollapseTest(token, densities, u, loadColumn, materialKg) {
   if (token !== currentRunToken) return;
 
   lastDensities = densities;
+  lastU = u;
   lastMaterialKg = materialKg;
 
   const testWeightKg = getWeightKg();
-  const scene = buildCollapseScene({ numElemX, numElemY, densities, loadColumn, testWeightKg, canvas });
+  const scene = buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas });
   if (!scene.ok) {
     setMessage(`${materialKg}kg of stone can't even form a structure here — try more stone, or a different spot.`);
     return;
@@ -129,7 +152,7 @@ function retest() {
     activeScene.stop();
     activeScene = null;
   }
-  startCollapseTest(token, lastDensities, lastLoadColumn, lastMaterialKg);
+  startCollapseTest(token, lastDensities, lastU, lastLoadColumn, lastMaterialKg);
 }
 
 // Idle until the first drop — a plain solid block, nothing computed yet.
