@@ -1,6 +1,7 @@
 import { nodeId, nodeDofs } from "./mesh.js";
 import { iterateTopologyOptimization } from "./optimize.js";
 import { renderDensities } from "./render.js";
+import { showReport, updateReport } from "./report.js";
 import { paintBackdrop, paintWaterOverlay } from "./backdrop.js";
 import { DOMAIN, SCENE_W, SCENE_H } from "./scene.js";
 import { buildCollapseScene } from "./collapse.js";
@@ -101,6 +102,8 @@ let lastDensities = null; // the last converged shape and its displacement
 let lastU = null; // field, cached so changing just the test weight
 let lastMaterialKg = null; // doesn't re-grow the structure
 
+const FINAL_HOLD_MS = 1800;
+
 function runFullCycle(loadColumn) {
   const token = ++currentRunToken;
   if (activeScene) {
@@ -118,6 +121,8 @@ function runFullCycle(loadColumn) {
 
   panelEl.classList.add("busy");
   setMessage("Growing the structure…");
+  const complianceHistory = [];
+  showReport();
   const iterator = iterateTopologyOptimization(numElemX, numElemY, fixedDofs, loads, { volumeFraction });
 
   function step() {
@@ -126,12 +131,23 @@ function runFullCycle(loadColumn) {
     const { value, done } = iterator.next();
     if (done) return;
 
-    renderDensities(ctx, value.densities);
+    renderDensities(ctx, value.densities, value.strainEnergy);
+    complianceHistory.push(value.compliance);
+    updateReport({
+      iteration: value.iteration,
+      history: complianceHistory,
+      maxChange: value.maxChange,
+      converged: value.converged,
+      finished: value.finished,
+      materialKg,
+    });
 
-    if (!value.converged) {
+    if (!value.finished) {
       requestAnimationFrame(step);
     } else {
-      startCollapseTest(token, value.densities, value.u, loadColumn, materialKg);
+      // Hold the finished heat map for a moment before the test starts, so
+      // there's time to see where the finished bridge is carrying load.
+      setTimeout(() => startCollapseTest(token, value.densities, value.u, loadColumn, materialKg), FINAL_HOLD_MS);
     }
   }
 

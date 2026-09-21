@@ -12,14 +12,14 @@ import { getElementStiffnessMatrix, matVec } from "./web/src/fem.js";
 import { assembleGlobalStiffness, solidDensities } from "./web/src/assemble.js";
 import { numDofs, nodeId, nodeDofs } from "./web/src/mesh.js";
 import { solveDisplacement } from "./web/src/structure.js";
-import { computeSensitivities } from "./web/src/sensitivity.js";
+import { computeSensitivities, computeElementWork } from "./web/src/sensitivity.js";
 import { filterSensitivities } from "./web/src/filter.js";
 import { updateDensities } from "./web/src/oc.js";
 import { assembleSparseStiffness, sparseMatVec } from "./web/src/sparse.js";
 import { conjugateGradient } from "./web/src/cg.js";
 import { reduceSystem } from "./web/src/boundary.js";
 import { solveLinearSystem } from "./web/src/linalg.js";
-import { runTopologyOptimization } from "./web/src/optimize.js";
+import { runTopologyOptimization, iterateTopologyOptimization } from "./web/src/optimize.js";
 import { findConnectedPath } from "./web/src/connectivity.js";
 import { computeStrain, planeStressD, computeStress, principalStresses, maxPrincipalStress } from "./web/src/stress.js";
 import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from "./web/src/buckling.js";
@@ -769,6 +769,58 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
     `real stress should match F/(t*H)=${textbookPa.toFixed(1)} Pa within 1%, got ${realStressPa.toFixed(1)} Pa`
   );
   console.log(`✓ real-unit stress matches the textbook F/(t·H) for a uniform bar (${realStressPa.toFixed(0)} Pa vs ${textbookPa.toFixed(0)} Pa)`);
+}
+
+// 30. The per-element work the growth heat map shows must sum to exactly the
+// compliance (f . u) the optimizer minimizes — on a non-uniform design, so a
+// density^penal mistake couldn't hide behind uniform densities.
+{
+  const numElemX = 8;
+  const numElemY = 4;
+  const densities = Array.from({ length: numElemY }, (_, ely) =>
+    Array.from({ length: numElemX }, (_, elx) => 0.3 + (0.7 * ((elx * 7 + ely * 3) % 5)) / 4)
+  );
+  const fixedDofs = [...nodeDofs(nodeId(0, 0, numElemX)), ...nodeDofs(nodeId(numElemX, 0, numElemX))];
+  const [, loadDof] = nodeDofs(nodeId(numElemX / 2, numElemY, numElemX));
+  const u = solveDisplacement(numElemX, numElemY, densities, fixedDofs, [[loadDof, -1]]);
+
+  const totalWork = computeElementWork(numElemX, numElemY, densities, u)
+    .flat()
+    .reduce((sum, w) => sum + w, 0);
+  const compliance = -1 * u[loadDof]; // f . u for a single unit downward load
+  assert.ok(
+    Math.abs(totalWork - compliance) < 1e-6 * Math.abs(compliance),
+    `element work should sum to compliance ${compliance}, got ${totalWork}`
+  );
+  console.log(`✓ per-element strain energy sums to exactly the compliance (${totalWork.toFixed(6)})`);
+}
+
+// 31. Hitting the iteration cap without converging must still hand the caller
+// one final frame (finished, with a displacement field matching the densities
+// it returned) — otherwise the page waits forever for a "converged" frame that
+// never comes. maxIterations=2 with a tight tolerance can't converge.
+{
+  const numElemX = 20;
+  const numElemY = 10;
+  const fixedDofs = [...nodeDofs(nodeId(0, 0, numElemX)), ...nodeDofs(nodeId(numElemX, 0, numElemX))];
+  const [, loadDof] = nodeDofs(nodeId(numElemX / 2, numElemY, numElemX));
+
+  const steps = [...iterateTopologyOptimization(numElemX, numElemY, fixedDofs, [[loadDof, -1]], {
+    volumeFraction: 0.4,
+    maxIterations: 2,
+    tolerance: 1e-12,
+  })];
+  const last = steps[steps.length - 1];
+  assert.equal(steps.length, 2, "should stop at maxIterations");
+  assert.ok(last.finished && !last.converged, "the capped last frame is finished but not converged");
+  assert.ok(steps.slice(0, -1).every((s) => !s.finished), "earlier frames are not finished");
+
+  const resolved = solveDisplacement(numElemX, numElemY, last.densities, fixedDofs, [[loadDof, -1]]);
+  assert.ok(
+    resolved.every((v, i) => Math.abs(v - last.u[i]) < 1e-6 * (1 + Math.abs(v))),
+    "the final frame's u must match the densities it carries"
+  );
+  console.log("✓ hitting the iteration cap still yields a final, consistent frame");
 }
 
 console.log("\nAll checks passed.");

@@ -17,7 +17,7 @@ function makeRng(seed) {
   };
 }
 
-const MOON = { x: 1560, y: 92, r: 52 };
+const MOON = { x: 640, y: 92, r: 52 };
 
 function paintSky(ctx) {
   const sky = ctx.createLinearGradient(0, 0, 0, WATER_SURFACE_Y);
