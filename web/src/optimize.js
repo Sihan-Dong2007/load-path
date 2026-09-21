@@ -68,6 +68,7 @@ export function* iterateTopologyOptimization(numElemX, numElemY, fixedDofs, load
     const strainEnergy = computeElementWork(numElemX, numElemY, densities, u);
     const dc = computeSensitivities(numElemX, numElemY, densities, u);
     const dcFiltered = filterSensitivities(numElemX, numElemY, densities, dc, rmin);
+    const solvedDensities = densities; // what this iteration's solve (u, strainEnergy) actually used
     const newDensities = updateDensities(numElemX, numElemY, densities, dcFiltered, volumeFraction, move);
 
     let maxChange = 0;
@@ -98,7 +99,22 @@ export function* iterateTopologyOptimization(numElemX, numElemY, fixedDofs, load
     // density barely moved on the very last step).
     const finalU = finished ? solveDisplacement(numElemX, numElemY, densities, fixedDofs, loads, { previousU: u }) : u;
 
-    yield { densities, iteration: iteration + 1, compliance, maxChange, converged, finished, u: finalU, strainEnergy };
+    yield {
+      densities,
+      iteration: iteration + 1,
+      compliance,
+      maxChange,
+      converged,
+      finished,
+      u: finalU,
+      strainEnergy,
+      // The state this iteration solved, kept whole so it can be replayed: the
+      // densities it started from, the displacement they produced, and how
+      // "important" each cell looked after smoothing (-dc, filtered).
+      solvedDensities,
+      solvedU: u,
+      importance: dcFiltered.map((row) => row.map((v) => -v)),
+    };
 
     if (finished) return;
   }

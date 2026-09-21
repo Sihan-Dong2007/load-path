@@ -12,6 +12,7 @@
 // the load actually runs.
 import { STONE_RGB } from "./theme.js";
 import { DOMAIN } from "./scene.js";
+import { nodePosition } from "./deform.js";
 
 const SOLID = 0.5;
 
@@ -122,5 +123,62 @@ export function renderDensities(ctx, densities, strainEnergy = null) {
   shade.addColorStop(1, "rgba(0,0,0,0.30)");
   ctx.fillStyle = shade;
   ctx.fillRect(DOMAIN.x, DOMAIN.y, DOMAIN.w, DOMAIN.h);
+  ctx.restore();
+}
+
+// Turns any per-cell quantity (strain energy, smoothed importance) into 0..1
+// heat values the same way for every view, so the colors mean the same thing
+// in each. Square root spreads out the low end, where most stone sits.
+export function normalizeHeat(values, densities) {
+  const hot = hotReference(values, densities);
+  return values.map((row) => row.map((v) => Math.min(1, Math.sqrt(Math.max(0, v) / hot))));
+}
+
+// The structure drawn as the deformed mesh: every cell is a quad on its four
+// displaced corner nodes, so it visibly bends under the load. `heat` is a
+// 0..1 grid from normalizeHeat (or null for plain stone). scale is pixels per
+// model unit; 0 draws it at rest.
+export function renderDeformed(ctx, densities, u, scale, heat = null) {
+  const numElemY = densities.length;
+  const numElemX = densities[0].length;
+  ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+
+  const corner = (col, row) => nodePosition(col, row, numElemX, numElemY, u, scale);
+  for (let ely = 0; ely < numElemY; ely++) {
+    for (let elx = 0; elx < numElemX; elx++) {
+      const density = densities[ely][elx];
+      if (density < 0.02) continue;
+
+      const a = corner(elx, ely);
+      const b = corner(elx + 1, ely);
+      const c = corner(elx + 1, ely + 1);
+      const d = corner(elx, ely + 1);
+      const tint = 0.975 + 0.05 * cellNoise(elx, ely);
+      const base = heat ? heatColor(heat[ely][elx]) : STONE_RGB;
+      const color = `rgb(${Math.round(base[0] * tint)},${Math.round(base[1] * tint)},${Math.round(base[2] * tint)})`;
+
+      ctx.globalAlpha = density;
+      ctx.fillStyle = color;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.lineTo(c.x, c.y);
+      ctx.lineTo(d.x, d.y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke(); // closes the hairline seams between neighboring quads
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.save();
+  ctx.globalCompositeOperation = "source-atop";
+  const shade = ctx.createLinearGradient(0, DOMAIN.y, 0, DOMAIN.y + DOMAIN.h);
+  shade.addColorStop(0, "rgba(255,252,240,0.14)");
+  shade.addColorStop(1, "rgba(0,0,0,0.30)");
+  ctx.fillStyle = shade;
+  ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
   ctx.restore();
 }

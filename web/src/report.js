@@ -1,5 +1,6 @@
-// The growth report card: live numbers from the optimizer, so the animation
-// explains itself. Everything shown is real data from the run — nothing is
+// The growth report card: live numbers from the optimizer, the four steps of
+// its loop, a scrubber over every recorded iteration, and what the finished
+// bridge can carry. Everything shown is real data from the run — nothing is
 // decorative.
 //
 // "Sag under load" is the compliance. With a single unit load, compliance
@@ -9,17 +10,25 @@
 // optimizer only moves it.
 import { HEAT_STOPS } from "./render.js";
 
-const card = document.getElementById("report");
-const iterEl = document.getElementById("rep-iter");
-const stoneEl = document.getElementById("rep-stone");
-const sagEl = document.getElementById("rep-sag");
-const noteEl = document.getElementById("rep-note");
-const spark = document.getElementById("rep-spark");
-const legendBar = document.getElementById("rep-legend");
+const $ = (id) => document.getElementById(id);
+const card = $("report");
+const iterEl = $("rep-iter");
+const stoneEl = $("rep-stone");
+const sagEl = $("rep-sag");
+const noteEl = $("rep-note");
+const spark = $("rep-spark");
+const stagesEl = $("rep-stages");
+const scrub = $("rep-scrub");
+const playBtn = $("rep-play");
+const skipBtn = $("rep-skip");
+const testBtn = $("rep-test");
+const resultEl = $("rep-result");
 
-legendBar.style.background = `linear-gradient(90deg, ${HEAT_STOPS.map(
+$("rep-legend").style.background = `linear-gradient(90deg, ${HEAT_STOPS.map(
   ([t, c]) => `rgb(${c[0]},${c[1]},${c[2]}) ${t * 100}%`
 ).join(", ")})`;
+
+let history = [];
 
 export function showReport() {
   card.classList.remove("hidden");
@@ -27,6 +36,49 @@ export function showReport() {
 
 export function hideReport() {
   card.classList.add("hidden");
+}
+
+// Wires the interactive bits once; main.js supplies what each does.
+export function bindControls({ onScrub, onPlay, onSkip, onTest }) {
+  scrub.addEventListener("input", () => onScrub(Number(scrub.value)));
+  playBtn.addEventListener("click", onPlay);
+  skipBtn.addEventListener("click", onSkip);
+  testBtn.addEventListener("click", onTest);
+}
+
+// Highlights one step of the optimizer's loop (1-4), or shows the loop as a
+// whole (null) once the explanation has been sped past.
+export function setStage(stage, note) {
+  stagesEl.classList.toggle("looping", stage === null);
+  for (const li of stagesEl.children) li.classList.toggle("active", Number(li.dataset.n) === stage);
+  if (note !== undefined) noteEl.textContent = note;
+}
+
+export function setSkipVisible(visible) {
+  skipBtn.hidden = !visible;
+}
+
+export function setPlaying(playing) {
+  playBtn.textContent = playing ? "❚❚" : "▶";
+}
+
+// The scrubber runs over every recorded iteration plus one more position for
+// the finished result.
+export function setScrubber({ max, value, enabled }) {
+  scrub.max = String(max);
+  scrub.value = String(value);
+  scrub.disabled = !enabled;
+  playBtn.disabled = !enabled;
+  testBtn.hidden = !enabled;
+}
+
+export function resetForRun() {
+  history = [];
+  setScrubber({ max: 1, value: 1, enabled: false });
+  setPlaying(false);
+  resultEl.hidden = true;
+  setSkipVisible(false);
+  setStage(null, "");
 }
 
 // What the optimizer is doing right now, in words, from how much it is
@@ -39,7 +91,7 @@ function narrate({ iteration, maxChange, converged, finished }) {
   return "Fine-tuning the edges.";
 }
 
-function drawSparkline(history) {
+function drawSparkline(marker) {
   const ctx = spark.getContext("2d");
   const w = spark.width;
   const h = spark.height;
@@ -76,18 +128,53 @@ function drawSparkline(history) {
   ctx.lineJoin = "round";
   ctx.stroke();
 
-  const last = history.length - 1;
+  const at = Math.min(history.length - 1, Math.max(0, marker));
   ctx.beginPath();
-  ctx.arc(x(last), y(history[last]), 5, 0, Math.PI * 2);
+  ctx.arc(x(at), y(history[at]), 5, 0, Math.PI * 2);
   ctx.fillStyle = "#fff4dc";
   ctx.fill();
 }
 
-export function updateReport({ iteration, history, maxChange, converged, finished, materialKg }) {
+function setSag(index) {
+  const ratio = history[Math.min(history.length - 1, index)] / history[0];
+  sagEl.textContent = `100% → ${Math.round(ratio * 100)}%`;
+}
+
+export function updateReport({ iteration, compliance, maxChange, converged, finished, materialKg }) {
+  history.push(compliance);
   iterEl.textContent = `iteration ${iteration}`;
   stoneEl.textContent = `${materialKg} kg, unchanged`;
-  const ratio = history[history.length - 1] / history[0];
-  sagEl.textContent = `100% → ${Math.round(ratio * 100)}%`;
+  setSag(history.length - 1);
   noteEl.textContent = narrate({ iteration, maxChange, converged, finished });
-  drawSparkline(history);
+  drawSparkline(history.length - 1);
+}
+
+// Which recorded iteration is on screen while scrubbing or replaying;
+// `index` is 1-based, and history.length + 1 means the finished result.
+export function setMarker(index) {
+  const isResult = index > history.length;
+  iterEl.textContent = isResult ? "result" : `iteration ${index} / ${history.length}`;
+  setSag(isResult ? history.length - 1 : index - 1);
+  drawSparkline(isResult ? history.length - 1 : index - 1);
+  scrub.value = String(index);
+  noteEl.textContent = isResult
+    ? "Result: the finished bridge."
+    : index === 1
+      ? "Stone spread evenly: the most it will ever sag."
+      : `Iteration ${index}: sagging ${Math.round((history[index - 1] / history[0]) * 100)}% of the start.`;
+}
+
+// What the finished bridge can carry, from failure.js's exact capacity.
+export function showResult({ holds, efficiency, safety, safe }) {
+  resultEl.hidden = false;
+  $("rep-holds").textContent = holds;
+  $("rep-eff").textContent = efficiency;
+  updateSafety({ safety, safe });
+}
+
+// The test weight changed without regrowing: only the safety line moves.
+export function updateSafety({ safety, safe }) {
+  const safetyEl = $("rep-safety");
+  safetyEl.textContent = safety;
+  safetyEl.className = safe ? "ok" : "warn";
 }

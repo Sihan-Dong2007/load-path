@@ -138,7 +138,7 @@
     position: fixed;
     top: 16px;
     right: 16px;
-    width: 268px;
+    width: 292px;
     padding: 11px 14px 13px;
     transform: scale(var(--ui));
     transform-origin: top right;
@@ -149,9 +149,8 @@
     border: 1px solid rgba(255, 255, 255, 0.10);
     border-radius: 16px;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.42);
-    pointer-events: none;
   }
-  #report.hidden { opacity: 0; }
+  #report.hidden { opacity: 0; pointer-events: none; }
   #report .rep-head { display: flex; justify-content: space-between; align-items: baseline; }
   #report h2 {
     margin: 0;
@@ -175,6 +174,47 @@
     color: #eef2f6;
     min-height: 2.8em;
   }
+
+  /* The optimizer's four steps; the current one lights up. */
+  #rep-stages { list-style: none; margin: 10px 0 0; padding: 0; }
+  #rep-stages li {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    padding: 3px 0 3px 8px;
+    border-left: 2px solid transparent;
+    font-size: 11px;
+    color: #8ea3b8;
+    opacity: 0.55;
+    transition: opacity 0.25s ease, border-color 0.25s ease;
+  }
+  #rep-stages li b { font-weight: 600; color: #cfdbe7; min-width: 62px; }
+  #rep-stages.looping li { opacity: 0.85; }
+  #rep-stages li.active { opacity: 1; border-left-color: var(--accent); background: rgba(230, 192, 123, 0.08); }
+  #rep-stages li.active b { color: var(--accent); }
+
+  .rep-controls { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .rep-controls input[type=range] { margin: 0; flex: 1; }
+  .rep-controls button, #rep-test {
+    font: inherit;
+    font-size: 11px;
+    color: #eef2f6;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 8px;
+    padding: 4px 9px;
+    cursor: pointer;
+  }
+  .rep-controls button:disabled, input[type=range]:disabled { opacity: 0.4; cursor: default; }
+  .rep-controls button:hover:not(:disabled), #rep-test:hover { background: rgba(255, 255, 255, 0.16); }
+  #rep-test { width: 100%; margin-top: 8px; }
+  [hidden] { display: none !important; }
+
+  #rep-result { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.09); }
+  #rep-result .rep-row { align-items: flex-start; gap: 12px; }
+  #rep-result .rep-row b { text-align: right; }
+  #rep-safety.ok { color: #9fe3a6; }
+  #rep-safety.warn { color: #ff9a7a; }
 
   #message {
     margin-top: 14px;
@@ -222,8 +262,28 @@
   <canvas id="rep-spark" width="480" height="120"></canvas>
   <div class="rep-row"><span>Stone used</span><b id="rep-stone"></b></div>
   <div class="rep-row"><span>Sag under load</span><b id="rep-sag"></b></div>
+
+  <ol id="rep-stages" class="looping">
+    <li data-n="1"><b>1 Solve</b><span>press on it, watch it bend</span></li>
+    <li data-n="2"><b>2 Measure</b><span>find the stone working hardest</span></li>
+    <li data-n="3"><b>3 Smooth</b><span>average with neighbours</span></li>
+    <li data-n="4"><b>4 Move</b><span>shift stone from idle to busy</span></li>
+  </ol>
   <div class="legend"><span>idle</span><i id="rep-legend"></i><span>carrying load</span></div>
   <div id="rep-note"></div>
+
+  <div class="rep-controls">
+    <button id="rep-play" title="Replay the iterations" disabled>&#9654;</button>
+    <input type="range" id="rep-scrub" min="1" max="1" value="1" disabled>
+    <button id="rep-skip" title="Skip the step-by-step explanation" hidden>Skip</button>
+  </div>
+  <button id="rep-test" hidden>Test it again</button>
+
+  <div id="rep-result" hidden>
+    <div class="rep-row"><span>Holds up to</span><b id="rep-holds"></b></div>
+    <div class="rep-row"><span>Efficiency</span><b id="rep-eff"></b></div>
+    <div class="rep-row"><span>Test weight</span><b id="rep-safety"></b></div>
+  </div>
 </div>
 
 <script src="vendor/matter.min.js"></script>

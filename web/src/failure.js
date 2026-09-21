@@ -120,3 +120,24 @@ export function evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, t
     right: { ...right, ...evaluateOne(right, axial.right) },
   };
 }
+
+// The heaviest test weight (kg) this shape holds — exactly, not by search.
+// The stress ratio and the truss axial force are both linear in the applied
+// force, and the buckling limit doesn't depend on it, so evaluating once at a
+// reference weight gives every threshold in closed form: the strength limit
+// is reference / stressRatio, the buckling limit reference * critical / axial.
+// evaluateHalves fails a half exactly when its ratio exceeds 1 or axial
+// exceeds critical, so a weight above this capacity fails and one below holds.
+// 0 for a shape whose halves aren't connected; Infinity if nothing limits it.
+export function loadCapacityKg({ numElemX, numElemY, densities, u, loadColumn }) {
+  const REFERENCE_KG = 1000;
+  const result = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg: REFERENCE_KG });
+  if (!result.ok) return 0;
+
+  const limits = [result.left, result.right].map((half) => {
+    const byStrength = half.stressRatio > 0 ? REFERENCE_KG / half.stressRatio : Infinity;
+    const byBuckling = half.axialForceN > 0 ? (REFERENCE_KG * half.criticalLoadN) / half.axialForceN : Infinity;
+    return Math.min(byStrength, byBuckling);
+  });
+  return Math.min(...limits);
+}

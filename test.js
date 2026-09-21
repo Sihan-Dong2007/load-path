@@ -23,7 +23,9 @@ import { runTopologyOptimization, iterateTopologyOptimization } from "./web/src/
 import { findConnectedPath } from "./web/src/connectivity.js";
 import { computeStrain, planeStressD, computeStress, principalStresses, maxPrincipalStress } from "./web/src/stress.js";
 import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from "./web/src/buckling.js";
-import { evaluateHalves } from "./web/src/failure.js";
+import { evaluateHalves, loadCapacityKg } from "./web/src/failure.js";
+import { nodePosition, deformScaleFor } from "./web/src/deform.js";
+import { DOMAIN } from "./web/src/scene.js";
 import { convexHull, polygonCentroid, groupCellsBySeed, buildShards } from "./web/src/fracture.js";
 import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2, stressScaleFactor, BRIDGE_DEPTH_M } from "./web/src/units.js";
 import { elementDofs } from "./web/src/mesh.js";
@@ -821,6 +823,85 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
     "the final frame's u must match the densities it carries"
   );
   console.log("✓ hitting the iteration cap still yields a final, consistent frame");
+}
+
+// 32. Drawing the deformed mesh: node positions must follow the displacement,
+// with the FEM's y-up flipped to the canvas's y-down. A synthetic
+// displacement pins the exact arithmetic; a real solve then confirms a
+// downward load really draws the loaded node lower on screen.
+{
+  const nx = 4;
+  const ny = 2;
+  const zero = new Array(numDofs(nx, ny)).fill(0);
+  const rest = nodePosition(0, 0, nx, ny, zero, 5);
+  assert.ok(rest.x === DOMAIN.x && rest.y === DOMAIN.y + DOMAIN.h, "at rest, node (0,0) sits at the domain's bottom-left");
+
+  const synthetic = new Array(numDofs(nx, ny)).fill(0);
+  const [dofX, dofY] = nodeDofs(nodeId(2, 1, nx));
+  synthetic[dofX] = 1;
+  synthetic[dofY] = -2; // 2 units DOWN in FEM terms
+  const base = nodePosition(2, 1, nx, ny, zero, 10);
+  const moved = nodePosition(2, 1, nx, ny, synthetic, 10);
+  assert.ok(Math.abs(moved.x - base.x - 10) < 1e-9, "ux=+1 at scale 10 moves the node 10px right");
+  assert.ok(Math.abs(moved.y - base.y - 20) < 1e-9, "uy=-2 (down) at scale 10 moves the node 20px DOWN the screen (larger y)");
+
+  const scale = deformScaleFor(synthetic, 0.1);
+  assert.ok(Math.abs(scale * 2 - 0.1 * DOMAIN.h) < 1e-9, "the largest displacement (2) must draw as exactly 10% of the domain height");
+
+  const fixed = [...nodeDofs(nodeId(0, 0, nx)), ...nodeDofs(nodeId(nx, 0, nx))];
+  const [, loadDof] = nodeDofs(nodeId(nx / 2, ny, nx));
+  const u = solveDisplacement(nx, ny, solidDensities(nx, ny), fixed, [[loadDof, -1]]);
+  const s = deformScaleFor(u, 0.1);
+  const loadedRest = nodePosition(nx / 2, ny, nx, ny, u, 0);
+  const loadedBent = nodePosition(nx / 2, ny, nx, ny, u, s);
+  assert.ok(loadedBent.y > loadedRest.y, "a downward load must draw the loaded node lower on screen");
+  console.log("✓ deformed-mesh geometry follows the displacement, y-flip included");
+}
+
+// 33. Load capacity is exact: just under it every half holds, just over it
+// something fails, and it scales with nothing the test weight touches. Run on
+// a real optimized shape so the strength and buckling paths are both live.
+{
+  const numElemX = 20;
+  const numElemY = 10;
+  const loadColumn = numElemX / 2;
+  const fixedDofs = [...nodeDofs(nodeId(0, 0, numElemX)), ...nodeDofs(nodeId(numElemX, 0, numElemX))];
+  const [, loadDof] = nodeDofs(nodeId(loadColumn, numElemY, numElemX));
+  const { densities, u } = runTopologyOptimization(numElemX, numElemY, fixedDofs, [[loadDof, -1]], { volumeFraction: 0.4 });
+
+  const capacity = loadCapacityKg({ numElemX, numElemY, densities, u, loadColumn });
+  assert.ok(Number.isFinite(capacity) && capacity > 0, `capacity should be a positive number, got ${capacity}`);
+
+  const under = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg: capacity * 0.999 });
+  const over = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg: capacity * 1.001 });
+  assert.ok(!under.left.fails && !under.right.fails, "just under the capacity, both halves must hold");
+  assert.ok(over.left.fails || over.right.fails, "just over the capacity, a half must fail");
+
+  const disconnected = solidDensities(numElemX, numElemY).map((row) => row.map(() => 0));
+  assert.equal(loadCapacityKg({ numElemX, numElemY, densities: disconnected, u, loadColumn }), 0, "no material, no capacity");
+  console.log(`✓ load capacity is exact: holds at 99.9% of ${capacity.toFixed(0)} kg, fails at 100.1%`);
+}
+
+// 34. The optimizer's per-iteration replay state must be self-consistent: each
+// iteration's densities are the next one's starting (solved) densities, and
+// the solved displacement really is the solution for the solved densities.
+{
+  const numElemX = 12;
+  const numElemY = 6;
+  const fixedDofs = [...nodeDofs(nodeId(0, 0, numElemX)), ...nodeDofs(nodeId(numElemX, 0, numElemX))];
+  const [, loadDof] = nodeDofs(nodeId(numElemX / 2, numElemY, numElemX));
+  const steps = [...iterateTopologyOptimization(numElemX, numElemY, fixedDofs, [[loadDof, -1]], { volumeFraction: 0.4, maxIterations: 4, tolerance: 1e-12 })];
+  assert.equal(steps.length, 4);
+  for (let i = 1; i < steps.length; i++) {
+    assert.deepEqual(steps[i].solvedDensities, steps[i - 1].densities, `iteration ${i + 1} must start from iteration ${i}'s result`);
+  }
+  const check = solveDisplacement(numElemX, numElemY, steps[2].solvedDensities, fixedDofs, [[loadDof, -1]]);
+  assert.ok(
+    check.every((v, i) => Math.abs(v - steps[2].solvedU[i]) < 1e-6 * (1 + Math.abs(v))),
+    "solvedU must be the displacement for solvedDensities"
+  );
+  assert.ok(steps.every((s) => s.importance.length === numElemY && s.importance[0].length === numElemX), "importance is a full grid");
+  console.log("✓ each iteration's replay state is self-consistent");
 }
 
 console.log("\nAll checks passed.");

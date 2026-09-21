@@ -1,7 +1,9 @@
 import { nodeId, nodeDofs } from "./mesh.js";
 import { iterateTopologyOptimization } from "./optimize.js";
 import { renderDensities } from "./render.js";
-import { showReport, updateReport } from "./report.js";
+import * as report from "./report.js";
+import { playGrowth, showFrame } from "./growth.js";
+import { loadCapacityKg } from "./failure.js";
 import { paintBackdrop, paintWaterOverlay } from "./backdrop.js";
 import { DOMAIN, SCENE_W, SCENE_H } from "./scene.js";
 import { buildCollapseScene } from "./collapse.js";
@@ -103,15 +105,27 @@ let lastU = null; // field, cached so changing just the test weight
 let lastMaterialKg = null; // doesn't re-grow the structure
 
 const FINAL_HOLD_MS = 1800;
+const REPLAY_FRAME_MS = 260;
 
-function runFullCycle(loadColumn) {
-  const token = ++currentRunToken;
+let lastPlayback = null; // every recorded iteration of the current run, for scrubbing/replay
+let lastCapacityKg = null; // what the finished bridge can carry, exactly (failure.js)
+const skip = { requested: false }; // "Skip" during the step-by-step explanation
+
+function stopEverything() {
+  ++currentRunToken;
   if (activeScene) {
     activeScene.stop();
     activeScene = null;
   }
+}
+
+async function runFullCycle(loadColumn) {
+  stopEverything();
+  const token = currentRunToken;
+  const isCancelled = () => token !== currentRunToken;
 
   lastLoadColumn = loadColumn;
+  lastPlayback = null;
   const materialKg = getMaterialKg();
   const volumeFraction = kgToVolumeFraction(materialKg);
 
@@ -121,38 +135,107 @@ function runFullCycle(loadColumn) {
 
   panelEl.classList.add("busy");
   setMessage("Growing the structure…");
-  const complianceHistory = [];
-  showReport();
+  report.showReport();
+  report.resetForRun();
+  skip.requested = false;
   const iterator = iterateTopologyOptimization(numElemX, numElemY, fixedDofs, loads, { volumeFraction });
 
-  function step() {
-    if (token !== currentRunToken) return;
+  const playback = await playGrowth({ iterator, ctx, isCancelled, materialKg, skip });
+  if (!playback) return;
 
-    const { value, done } = iterator.next();
-    if (done) return;
+  lastPlayback = playback;
+  const { final } = playback;
+  lastDensities = final.densities;
+  lastU = final.u;
+  lastMaterialKg = materialKg;
 
-    renderDensities(ctx, value.densities, value.strainEnergy);
-    complianceHistory.push(value.compliance);
-    updateReport({
-      iteration: value.iteration,
-      history: complianceHistory,
-      maxChange: value.maxChange,
-      converged: value.converged,
-      finished: value.finished,
-      materialKg,
-    });
+  lastCapacityKg = loadCapacityKg({ numElemX, numElemY, densities: final.densities, u: final.u, loadColumn });
+  showResult();
+  report.setScrubber({ max: playback.frames.length + 1, value: playback.frames.length + 1, enabled: true });
 
-    if (!value.finished) {
-      requestAnimationFrame(step);
-    } else {
-      // Hold the finished heat map for a moment before the test starts, so
-      // there's time to see where the finished bridge is carrying load.
-      setTimeout(() => startCollapseTest(token, value.densities, value.u, loadColumn, materialKg), FINAL_HOLD_MS);
-    }
-  }
-
-  requestAnimationFrame(step);
+  // Hold the finished heat map for a moment before the test starts, so
+  // there's time to see where the finished bridge is carrying load.
+  await new Promise((resolve) => setTimeout(resolve, FINAL_HOLD_MS));
+  if (isCancelled()) return;
+  startCollapseTest(token, final.densities, final.u, loadColumn, materialKg);
 }
+
+// The capacity readout: what the finished shape holds, how efficiently it uses
+// its stone, and how the current test weight compares.
+function showResult() {
+  const capacity = lastCapacityKg;
+  const test = getWeightKg();
+  report.showResult({
+    holds: capacity === 0 ? "nothing: not connected" : Number.isFinite(capacity) ? formatWeightKg(capacity) : "no limit found",
+    efficiency: capacity > 0 && Number.isFinite(capacity) ? `${Math.round(capacity / lastMaterialKg).toLocaleString()} kg per kg of stone` : "\u2014",
+    ...safetyText(capacity, test),
+  });
+}
+
+function safetyText(capacity, test) {
+  if (capacity === 0) return { safety: `${formatWeightKg(test)}: cannot carry it`, safe: false };
+  if (!Number.isFinite(capacity)) return { safety: `${formatWeightKg(test)}: holds`, safe: true };
+  const factor = capacity / test;
+  return factor >= 1
+    ? { safety: `${Math.round(test).toLocaleString()} kg: safe, ${factor.toFixed(2)}\u00d7 to spare`, safe: true }
+    : { safety: `${Math.round(test).toLocaleString()} kg: over by ${(1 / factor).toFixed(2)}\u00d7`, safe: false };
+}
+
+// Scrubbing takes over the canvas: whatever was pending (the test about to
+// start, a physics test in progress, a replay) is cancelled, and the chosen
+// recorded iteration is drawn.
+function scrubTo(index) {
+  if (!lastPlayback) return;
+  stopEverything();
+  playing = false;
+  report.setPlaying(false);
+  panelEl.classList.remove("busy");
+  showFrame(ctx, lastPlayback, index);
+  report.setMarker(index);
+  setMessage("Scrubbing through the optimizer's iterations.");
+}
+
+let playing = false;
+async function togglePlay() {
+  if (!lastPlayback) return;
+  if (playing) {
+    stopEverything();
+    playing = false;
+    report.setPlaying(false);
+    return;
+  }
+  stopEverything();
+  const token = currentRunToken;
+  playing = true;
+  report.setPlaying(true);
+  const last = lastPlayback.frames.length + 1;
+  for (let k = 1; k <= last; k++) {
+    if (token !== currentRunToken) return;
+    showFrame(ctx, lastPlayback, k);
+    report.setMarker(k);
+    await new Promise((resolve) => setTimeout(resolve, REPLAY_FRAME_MS));
+  }
+  if (token === currentRunToken) {
+    playing = false;
+    report.setPlaying(false);
+  }
+}
+
+report.bindControls({
+  onScrub: scrubTo,
+  onPlay: togglePlay,
+  onSkip: () => {
+    skip.requested = true;
+    report.setSkipVisible(false);
+  },
+  onTest: () => {
+    if (lastPlayback) {
+      report.setMarker(lastPlayback.frames.length + 1);
+      showFrame(ctx, lastPlayback, lastPlayback.frames.length + 1);
+    }
+    retest();
+  },
+});
 
 function startCollapseTest(token, densities, u, loadColumn, materialKg) {
   if (token !== currentRunToken) return;
@@ -195,12 +278,14 @@ function startCollapseTest(token, densities, u, loadColumn, materialKg) {
 // current position/material, since changing only the test weight doesn't
 // change what shape the optimizer would produce.
 function retest() {
-  if (lastDensities === null) return;
-  const token = ++currentRunToken;
-  if (activeScene) {
-    activeScene.stop();
-    activeScene = null;
-  }
+  // Nothing to re-test until a run has FINISHED growing: changing the weight
+  // mid-growth must not cancel the growth and test a stale earlier shape.
+  if (lastPlayback === null) return;
+  stopEverything();
+  const token = currentRunToken;
+  playing = false;
+  report.setPlaying(false);
+  if (lastCapacityKg !== null) report.updateSafety(safetyText(lastCapacityKg, getWeightKg()));
   startCollapseTest(token, lastDensities, lastU, lastLoadColumn, lastMaterialKg);
 }
 
