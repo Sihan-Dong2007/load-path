@@ -1,4 +1,4 @@
-// Bundles the real phone UI (footron/controls/lib/index.js) for a local smoke test,
+// Bundles the real phone UI (controls/lib/index.js) for a local smoke test,
 // with the Footron messaging hook swapped for dev/controls-client-stub.js.
 //   cd dev && npm install && npm run build-phone
 // then serve with `python3 serve.py 8950 --dev` and open /dev/phone-react.html.

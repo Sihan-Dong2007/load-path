@@ -27,7 +27,7 @@ import { evaluateHalves, loadCapacityKg, loadLimit, stressRatioMap } from "./web
 import { nodePosition, deformScaleFor } from "./web/src/deform.js";
 import { DOMAIN } from "./web/src/scene.js";
 import { dispatchControlMessage, footronEnabled, spotToColumn as wallSpotToColumn, RANGES as WALL_RANGES, LESSON_IDS, BRUSH_RANGE as WALL_BRUSH, BOARD_RANGE } from "./web/src/footron.js";
-import * as phone from "./footron/controls/lib/protocol.js";
+import * as phone from "./controls/lib/protocol.js";
 import { LESSONS as WALL_LESSONS } from "./web/src/lessons.js";
 import { weightToSliderValue } from "./web/src/lessons.js";
 import { setupKey, encodeDesign, decodeDesign, loadBoard, addResult } from "./web/src/storage.js";

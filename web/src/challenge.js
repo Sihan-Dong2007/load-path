@@ -506,17 +506,25 @@ export function enterChallenge(hostContext) {
   setBrush(1);
   resetDesign();
 
+  // On the wall there is no mouse or touchscreen at all — a phone is the only
+  // input there is — so this is more than a convenience: leaving these bound
+  // would mean the canvas keeps reacting to a pointer that, on real hardware,
+  // physically cannot exist. host.wallMode also gates every other pointer
+  // surface (the drag-and-drop handle, the sliders) the same way; this is the
+  // one this module owns.
   const { canvas } = host;
-  canvas.addEventListener("pointerdown", onDown);
-  canvas.addEventListener("pointermove", onMove);
-  canvas.addEventListener("pointerup", onUp);
-  canvas.addEventListener("pointercancel", onUp);
-  canvas.addEventListener("pointerleave", onLeave);
-  canvas.addEventListener("contextmenu", noMenu);
-  canvas.style.cursor = "crosshair";
-  canvas.style.pointerEvents = "auto";
-  // Without this a touch drag scrolls or zooms the page instead of painting.
-  canvas.style.touchAction = "none";
+  if (!host.wallMode) {
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+    canvas.addEventListener("pointerleave", onLeave);
+    canvas.addEventListener("contextmenu", noMenu);
+    canvas.style.cursor = "crosshair";
+    canvas.style.pointerEvents = "auto";
+    // Without this a touch drag scrolls or zooms the page instead of painting.
+    canvas.style.touchAction = "none";
+  }
   card.hidden = false;
   renderBoard();
   redraw();

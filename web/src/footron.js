@@ -2,14 +2,14 @@
 //
 // The wall has no keyboard, no mouse and no touchscreen, so a visitor's phone is
 // the whole of the exhibit's input. Footron serves a small React UI to the
-// phone (`footron/controls/lib/index.js` in this repo, copied into the
+// phone (`controls/lib/index.js` in this repo, copied into the
 // experience by scripts/package-footron.mjs) which talks to this page over a
 // WebSocket. This module is the receiving end.
 //
 // Messages go phone -> wall only, as in the other exhibits on the wall, so the
 // wall must cope with any message arriving in any state (a "test" before
 // anything has grown, say) by quietly ignoring it. Protocol (keep in sync with
-// footron/controls/lib/protocol.js — test.js checks the two agree):
+// controls/lib/protocol.js — test.js checks the two agree):
 //
 //   { type: "setup", key: "stone",  value: <kg> }        how much stone
 //   { type: "setup", key: "weight", value: <0..1> }      test weight, along its log slider
@@ -45,7 +45,7 @@ export const BOARD_RANGE = [1, 5];
 
 // Where a 0..1 position along the span lands, as a load column. Kept clear of the
 // two supports: a weight AT a support is no bridge at all. The phone draws its
-// pad's weight arrow from the same rule (footron/controls/lib/protocol.js).
+// pad's weight arrow from the same rule (controls/lib/protocol.js).
 export function spotToColumn(fraction, numElemX) {
   return Math.min(numElemX - 3, Math.max(3, Math.round(fraction * numElemX)));
 }

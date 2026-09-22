@@ -364,6 +364,7 @@ function enterChallenge() {
     algorithm: { densities: lastPlayback.final.densities, u: lastPlayback.final.u, capacity: lastCapacityKg },
     evenSpreadCompliance: lastPlayback.frames[0].compliance,
     deformScale: lastPlayback.scale,
+    wallMode: onWall,
     runTest: (densities, u) => {
       stopEverything();
       startCollapseTest(currentRunToken, densities, u, lastLoadColumn, lastMaterialKg);
