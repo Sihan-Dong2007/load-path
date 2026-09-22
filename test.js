@@ -26,6 +26,7 @@ import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from 
 import { evaluateHalves, loadCapacityKg } from "./web/src/failure.js";
 import { nodePosition, deformScaleFor } from "./web/src/deform.js";
 import { DOMAIN } from "./web/src/scene.js";
+import { createDesign, countCells, budgetCells, paintBrush, toDensities, supportsConnected, connectionStatus, connectionHint, VOID_DENSITY } from "./web/src/design.js";
 import { convexHull, polygonCentroid, groupCellsBySeed, buildShards } from "./web/src/fracture.js";
 import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2, stressScaleFactor, BRIDGE_DEPTH_M } from "./web/src/units.js";
 import { elementDofs } from "./web/src/mesh.js";
@@ -902,6 +903,100 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   );
   assert.ok(steps.every((s) => s.importance.length === numElemY && s.importance[0].length === numElemX), "importance is a full grid");
   console.log("✓ each iteration's replay state is self-consistent");
+}
+
+// 35. The visitor's design: the stone budget is a hard limit, erasing gives it
+// back, and a bridge only counts once BOTH supports reach the weight.
+{
+  const nx = 12;
+  const ny = 6;
+  assert.equal(budgetCells(0.4, nx, ny), Math.round(0.4 * nx * ny), "budget = the optimizer's stone, in whole cells");
+
+  const design = createDesign(nx, ny);
+  assert.equal(countCells(design), 0);
+
+  // A big brush stroke can't go past the budget.
+  paintBrush(design, 6, 3, 5, false, 10);
+  assert.equal(countCells(design), 10, "painting stops exactly at the budget");
+  assert.equal(paintBrush(design, 6, 3, 5, false, 10), 0, "with the budget spent, more painting changes nothing");
+
+  // Erasing frees stone that can then be spent elsewhere.
+  const freed = paintBrush(design, 6, 3, 5, true, 10);
+  assert.equal(freed, 10, "the erase stroke removed every painted cell");
+  assert.equal(countCells(design), 0);
+  assert.equal(paintBrush(design, 0, 0, 0, false, 10), 1, "radius 0 paints exactly one cell");
+
+  // Densities: painted cells solid, everything else the optimizer's "empty".
+  const densities = toDensities(design);
+  assert.equal(densities[0][0], 1);
+  assert.equal(densities[3][3], VOID_DENSITY);
+
+  // Connectivity: an arch from corner to corner reaches the load; a single
+  // leg, or two legs that never meet, does not.
+  const arch = createDesign(nx, ny);
+  const load = 6;
+  for (let i = 0; i < ny; i++) {
+    arch[i][Math.min(load - 1, i)] = 1; // left leg climbs toward the load
+    arch[i][Math.max(load, nx - 1 - i)] = 1; // right leg mirrors it
+  }
+  assert.ok(supportsConnected(arch, load), "two legs meeting under the weight are connected");
+  const oneLeg = arch.map((row, y) => row.map((v, x) => (x >= load ? 0 : v)));
+  assert.ok(!supportsConnected(oneLeg, load), "one leg alone is not a bridge");
+  assert.ok(!supportsConnected(createDesign(nx, ny), load), "an empty design is not connected");
+  console.log("✓ the visitor's design respects the stone budget, and connectivity needs both legs");
+}
+
+// 36. The comparison the challenge makes must be apples to apples. Solved by
+// the same model, more stone can never sag more (a stiffness sanity check on
+// the plumbing), and the optimizer's own shape, thresholded to whole cells,
+// is a valid, connected, solvable design.
+{
+  const nx = 20;
+  const ny = 10;
+  const load = nx / 2;
+  const fixedDofs = [...nodeDofs(nodeId(0, 0, nx)), ...nodeDofs(nodeId(nx, 0, nx))];
+  const [, loadDof] = nodeDofs(nodeId(load, ny, nx));
+  const sag = (design) => -solveDisplacement(nx, ny, toDensities(design), fixedDofs, [[loadDof, -1]])[loadDof];
+
+  const { densities } = runTopologyOptimization(nx, ny, fixedDofs, [[loadDof, -1]], { volumeFraction: 0.4 });
+  const traced = densities.map((row) => row.map((v) => (v > 0.5 ? 1 : 0)));
+  assert.ok(supportsConnected(traced, load), "the optimizer's shape, thresholded to whole cells, is connected");
+
+  const tracedSag = sag(traced);
+  assert.ok(Number.isFinite(tracedSag) && tracedSag > 0, `a connected design has a finite positive sag, got ${tracedSag}`);
+
+  const fuller = traced.map((row, y) => row.map((v, x) => (v === 1 || (y < 3 && Math.abs(x - load) < 6) ? 1 : 0)));
+  assert.ok(countCells(fuller) > countCells(traced));
+  assert.ok(sag(fuller) < tracedSag, "adding stone to a design must not make it sag more");
+  console.log(`✓ challenge designs are solved by the same model (traced optimizer shape sags ${tracedSag.toFixed(2)}, more stone sags less)`);
+}
+
+// 37. The "not connected" hint must name what is actually missing.
+{
+  const nx = 12;
+  const ny = 6;
+  const load = 6;
+  const empty = createDesign(nx, ny);
+  assert.ok(/two marked corner cells/.test(connectionHint(connectionStatus(empty, load))));
+
+  const leftOnly = createDesign(nx, ny);
+  leftOnly[0][0] = 1;
+  assert.ok(/right corner cell/.test(connectionHint(connectionStatus(leftOnly, load))), "only the left corner is stone: ask for the right one");
+
+  const cornersOnly = createDesign(nx, ny);
+  cornersOnly[0][0] = 1;
+  cornersOnly[0][nx - 1] = 1;
+  assert.ok(/Reach the weight/.test(connectionHint(connectionStatus(cornersOnly, load))), "corners are stone but nothing reaches the weight");
+
+  // A full left leg and a right leg with a gap in it: only the right is named.
+  const gapped = createDesign(nx, ny);
+  for (let i = 0; i < ny; i++) gapped[i][Math.min(load - 1, i)] = 1;
+  gapped[0][nx - 1] = 1;
+  gapped[ny - 1][load] = 1; // stone at the top under the weight, but not joined to the right support
+  const status = connectionStatus(gapped, load);
+  assert.ok(status.left && !status.right, "left joined, right not");
+  assert.ok(/right support/.test(connectionHint(status)), "the hint names the right support");
+  console.log("\u2713 the not-connected hint names exactly what is missing");
 }
 
 console.log("\nAll checks passed.");

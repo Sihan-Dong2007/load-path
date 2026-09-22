@@ -4,6 +4,7 @@ import { renderDensities } from "./render.js";
 import * as report from "./report.js";
 import { playGrowth, showFrame } from "./growth.js";
 import { loadCapacityKg } from "./failure.js";
+import * as challenge from "./challenge.js";
 import { paintBackdrop, paintWaterOverlay } from "./backdrop.js";
 import { DOMAIN, SCENE_W, SCENE_H } from "./scene.js";
 import { buildCollapseScene } from "./collapse.js";
@@ -120,6 +121,8 @@ function stopEverything() {
 }
 
 async function runFullCycle(loadColumn) {
+  challenge.leave();
+  report.showReport();
   stopEverything();
   const token = currentRunToken;
   const isCancelled = () => token !== currentRunToken;
@@ -221,7 +224,48 @@ async function togglePlay() {
   }
 }
 
+// Hands the finished run to the visitor's editor: same load, same supports,
+// same stone budget, judged by the same model.
+function enterChallenge() {
+  if (!lastPlayback) return;
+  stopEverything();
+  playing = false;
+  report.setPlaying(false);
+  panelEl.classList.remove("busy");
+  report.hideReport();
+  setMessage("Your turn: lay stone with the same budget as the algorithm.");
+  challenge.enterChallenge({
+    ctx,
+    canvas,
+    numElemX,
+    numElemY,
+    fixedDofs,
+    loadColumn: lastLoadColumn,
+    volumeFraction: kgToVolumeFraction(lastMaterialKg),
+    algorithm: { densities: lastPlayback.final.densities, u: lastPlayback.final.u, capacity: lastCapacityKg },
+    evenSpreadCompliance: lastPlayback.frames[0].compliance,
+    deformScale: lastPlayback.scale,
+    runTest: (densities, u) => {
+      stopEverything();
+      startCollapseTest(currentRunToken, densities, u, lastLoadColumn, lastMaterialKg);
+    },
+    stopTest: () => {
+      stopEverything();
+      panelEl.classList.remove("busy");
+    },
+    onExit: () => {
+      stopEverything();
+      report.showReport();
+      showFrame(ctx, lastPlayback, lastPlayback.frames.length + 1);
+      report.setMarker(lastPlayback.frames.length + 1);
+      panelEl.classList.remove("busy");
+      setMessage("Back to the algorithm's bridge.");
+    },
+  });
+}
+
 report.bindControls({
+  onChallenge: enterChallenge,
   onScrub: scrubTo,
   onPlay: togglePlay,
   onSkip: () => {
@@ -239,10 +283,6 @@ report.bindControls({
 
 function startCollapseTest(token, densities, u, loadColumn, materialKg) {
   if (token !== currentRunToken) return;
-
-  lastDensities = densities;
-  lastU = u;
-  lastMaterialKg = materialKg;
 
   const testWeightKg = getWeightKg();
   const scene = buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas });
@@ -279,8 +319,9 @@ function startCollapseTest(token, densities, u, loadColumn, materialKg) {
 // change what shape the optimizer would produce.
 function retest() {
   // Nothing to re-test until a run has FINISHED growing: changing the weight
-  // mid-growth must not cancel the growth and test a stale earlier shape.
-  if (lastPlayback === null) return;
+  // mid-growth must not cancel the growth and test a stale earlier shape. And
+  // while the visitor is painting their own bridge, the canvas is theirs.
+  if (lastPlayback === null || challenge.isActive()) return;
   stopEverything();
   const token = currentRunToken;
   playing = false;

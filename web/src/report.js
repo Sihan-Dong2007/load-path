@@ -22,6 +22,7 @@ const scrub = $("rep-scrub");
 const playBtn = $("rep-play");
 const skipBtn = $("rep-skip");
 const testBtn = $("rep-test");
+const challengeBtn = $("rep-challenge");
 const resultEl = $("rep-result");
 
 $("rep-legend").style.background = `linear-gradient(90deg, ${HEAT_STOPS.map(
@@ -39,11 +40,12 @@ export function hideReport() {
 }
 
 // Wires the interactive bits once; main.js supplies what each does.
-export function bindControls({ onScrub, onPlay, onSkip, onTest }) {
+export function bindControls({ onScrub, onPlay, onSkip, onTest, onChallenge }) {
   scrub.addEventListener("input", () => onScrub(Number(scrub.value)));
   playBtn.addEventListener("click", onPlay);
   skipBtn.addEventListener("click", onSkip);
   testBtn.addEventListener("click", onTest);
+  challengeBtn.addEventListener("click", onChallenge);
 }
 
 // Highlights one step of the optimizer's loop (1-4), or shows the loop as a
@@ -70,6 +72,7 @@ export function setScrubber({ max, value, enabled }) {
   scrub.disabled = !enabled;
   playBtn.disabled = !enabled;
   testBtn.hidden = !enabled;
+  challengeBtn.hidden = !enabled;
 }
 
 export function resetForRun() {
