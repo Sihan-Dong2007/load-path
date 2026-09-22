@@ -56,7 +56,21 @@ function cellNoise(elx, ely) {
   return h - Math.floor(h);
 }
 
+// The finished structure at rest, colored by how close each cell is to its
+// tensile limit AT THE TEST WEIGHT: an absolute scale, not normalized like the
+// growth heat map, so red really means "at the limit" (ratio 1) and a bridge
+// with a wide safety margin looks cool all over.
+export function renderStress(ctx, densities, ratios) {
+  drawRest(ctx, densities, (elx, ely) => Math.min(1, Math.max(0, ratios[ely][elx])));
+}
+
 export function renderDensities(ctx, densities, strainEnergy = null) {
+  const hot = strainEnergy ? hotReference(strainEnergy, densities) : 1;
+  drawRest(ctx, densities, strainEnergy ? (elx, ely) => Math.min(1, Math.sqrt(Math.max(0, strainEnergy[ely][elx]) / hot)) : null);
+}
+
+// heatAt(elx, ely) returns 0..1 on the heat ramp, or heatAt is null for plain stone.
+function drawRest(ctx, densities, heatAt) {
   const numElemY = densities.length;
   const numElemX = densities[0].length;
   const cellWidth = DOMAIN.w / numElemX;
@@ -65,7 +79,6 @@ export function renderDensities(ctx, densities, strainEnergy = null) {
     elx >= 0 && elx < numElemX && ely >= 0 && ely < numElemY && densities[ely][elx] > SOLID;
 
   ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-  const hot = strainEnergy ? hotReference(strainEnergy, densities) : 1;
 
   for (let ely = 0; ely < numElemY; ely++) {
     for (let elx = 0; elx < numElemX; elx++) {
@@ -75,9 +88,7 @@ export function renderDensities(ctx, densities, strainEnergy = null) {
       const x = DOMAIN.x + elx * cellWidth;
       const y = DOMAIN.y + (numElemY - 1 - ely) * cellHeight;
       const tint = 0.975 + 0.05 * cellNoise(elx, ely);
-      const base = strainEnergy
-        ? heatColor(Math.min(1, Math.sqrt(Math.max(0, strainEnergy[ely][elx]) / hot)))
-        : STONE_RGB;
+      const base = heatAt ? heatColor(heatAt(elx, ely)) : STONE_RGB;
       ctx.globalAlpha = density;
       ctx.fillStyle = `rgb(${Math.round(base[0] * tint)},${Math.round(base[1] * tint)},${Math.round(base[2] * tint)})`;
       // Pad each cell by 1px so adjacent cells don't leave hairline gaps

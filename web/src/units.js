@@ -16,13 +16,15 @@ export const BRIDGE_DEPTH_M = 0.3; // the bridge's actual width, i.e. the
 // Stone/masonry. Real stone is much weaker in tension than compression —
 // classical arch bridges are literally shaped to keep the stone in
 // compression and avoid tension entirely, which is the whole reason the
-// arch form exists. Our FEM model has a single strength value (it doesn't
-// distinguish tension from compression, a standard simplification for this
-// class of algorithm), so using the TENSILE value here is the honest,
-// conservative choice — the one that doesn't overstate what stone can
-// actually take.
+// arch form exists. So the two are checked separately (failure.js): the
+// per-element FEM check uses the TENSILE strength below, and a strut's
+// compressive force is checked against the much larger COMPRESSIVE strength.
 export const STONE_DENSITY_KG_M3 = 2600;
 export const STONE_TENSILE_STRENGTH_PA = 5e6; // 5 MPa
+// Stone is far stronger squeezed than pulled — typically ~10x, which is why
+// arch bridges work. 50 MPa is a representative value for limestone/granite
+// masonry, not a measurement of any particular stone.
+export const STONE_COMPRESSIVE_STRENGTH_PA = 5e7; // 50 MPa
 // Needed specifically for buckling — unlike the strength check, buckling
 // resistance depends on how STIFF a member is (E), not just how strong it
 // is, so this is a genuinely new physical constant, not a restatement of

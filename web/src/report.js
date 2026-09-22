@@ -31,6 +31,13 @@ $("rep-legend").style.background = `linear-gradient(90deg, ${HEAT_STOPS.map(
 
 let history = [];
 
+// The heat ramp means different things in different views: how hard the stone
+// is working while the bridge grows, how close it is to breaking once it has.
+export function setLegend(mode) {
+  $("rep-legend-lo").textContent = mode === "stress" ? "safe" : "idle";
+  $("rep-legend-hi").textContent = mode === "stress" ? "at its limit" : "carrying load";
+}
+
 export function showReport() {
   card.classList.remove("hidden");
 }
@@ -75,8 +82,13 @@ export function setScrubber({ max, value, enabled }) {
   challengeBtn.hidden = !enabled;
 }
 
+export function setNote(text) {
+  noteEl.textContent = text;
+}
+
 export function resetForRun() {
   history = [];
+  setLegend("energy");
   setScrubber({ max: 1, value: 1, enabled: false });
   setPlaying(false);
   resultEl.hidden = true;
@@ -157,20 +169,22 @@ export function updateReport({ iteration, compliance, maxChange, converged, fini
 export function setMarker(index) {
   const isResult = index > history.length;
   iterEl.textContent = isResult ? "result" : `iteration ${index} / ${history.length}`;
+  setLegend(isResult ? "stress" : "energy");
   setSag(isResult ? history.length - 1 : index - 1);
   drawSparkline(isResult ? history.length - 1 : index - 1);
   scrub.value = String(index);
   noteEl.textContent = isResult
-    ? "Result: the finished bridge."
+    ? "Result: how close each stone is to breaking at the test weight."
     : index === 1
       ? "Stone spread evenly: the most it will ever sag."
       : `Iteration ${index}: sagging ${Math.round((history[index - 1] / history[0]) * 100)}% of the start.`;
 }
 
 // What the finished bridge can carry, from failure.js's exact capacity.
-export function showResult({ holds, efficiency, safety, safe }) {
+export function showResult({ holds, limit, efficiency, safety, safe }) {
   resultEl.hidden = false;
   $("rep-holds").textContent = holds;
+  $("rep-limit").textContent = limit;
   $("rep-eff").textContent = efficiency;
   updateSafety({ safety, safe });
 }

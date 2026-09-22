@@ -26,6 +26,26 @@ const MIN_SHARDS = 3;
 const MAX_SHARDS = 20;
 const CELLS_PER_SHARD_TARGET = 25;
 
+// How fast the break travels through the stone, and the longest it may take
+// to reach the farthest shard (kept under the ~0.5s of stillness hasSettled
+// needs, and hasSettled also waits for every release to have happened).
+const PROPAGATION_PX_PER_MS = 2.2;
+const MAX_PROPAGATION_MS = 380;
+const FLASH_MS = 420;
+
+// Slow motion at the moment of breaking: the physics clock drops to
+// SLOWMO_SCALE for SLOWMO_HOLD_MS, then eases back to full speed over
+// SLOWMO_RAMP_MS. Skipped entirely for people who ask their system for
+// reduced motion.
+const SLOWMO_SCALE = 0.3;
+const SLOWMO_HOLD_MS = 450;
+const SLOWMO_RAMP_MS = 450;
+const SLOWMO_STEP_MS = 40;
+
+function prefersReducedMotion() {
+  return typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
 function shardCountFor(cellCount) {
   return Math.max(MIN_SHARDS, Math.min(MAX_SHARDS, Math.round(cellCount / CELLS_PER_SHARD_TARGET)));
 }
@@ -48,7 +68,7 @@ function shardCountFor(cellCount) {
 // there's nothing to test, so the caller should treat that as an
 // automatic failure without spawning any physics. Otherwise returns an
 // object with dropBall()/hasSettled()/collapsed()/stop().
-export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas }) {
+export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas, effects = {} }) {
   const evaluation = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg });
   if (!evaluation.ok) return { ok: false };
 
@@ -95,9 +115,9 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
   // check evaluated, not an idealized straight beam — split into a few
   // convex shards so a failure can shatter it instead of dropping one
   // rigid slab. All shards start static (the half "resting" as tested);
-  // the whole group is set dynamic together the moment this half is
-  // determined to fail (see markBroken below), not per-shard, since the
-  // physics decision itself is made at the half level, not the shard level.
+  // the shards are freed once the ball lands (see scheduleRelease below),
+  // spreading outward from where the failure starts; the decision itself is
+  // made at the half level, not the shard level.
   let nextShardSeed = 1;
   function buildShardBodies(half) {
     const shards = buildShards(half.cells, shardCountFor(half.cells.length), (cell) => cellCorners(cell.elx, cell.ely));
@@ -148,8 +168,33 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     for (const body of leftShards) drawShard(ctx, body);
     for (const body of rightShards) drawShard(ctx, body);
     drawWeight(ctx, testBall);
+    drawCrackFlashes(ctx);
   });
   const dust = createDustSystem(render);
+
+  // A ring that expands and fades from each crack origin.
+  function drawCrackFlashes(ctx) {
+    const now = performance.now();
+    for (let i = flashes.length - 1; i >= 0; i--) {
+      const t = (now - flashes[i].start) / FLASH_MS;
+      if (t >= 1) {
+        flashes.splice(i, 1);
+        continue;
+      }
+      const { x, y } = flashes[i];
+      ctx.save();
+      ctx.strokeStyle = `rgba(255,236,190,${0.95 * (1 - t)})`;
+      ctx.lineWidth = 1 + 7 * (1 - t);
+      ctx.beginPath();
+      ctx.arc(x, y, 14 + 90 * t, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = `rgba(255,248,225,${0.9 * (1 - t)})`;
+      ctx.beginPath();
+      ctx.arc(x, y, 9 * (1 - t) + 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
 
   // How hard the drop reads, for both the audio and the dust: derived from
   // the same exponent range main.js maps the weight slider onto, so a
@@ -160,21 +205,65 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     Math.max(0, (Math.log10(testWeightKg) - WEIGHT_EXPONENT_MIN) / (WEIGHT_EXPONENT_MAX - WEIGHT_EXPONENT_MIN))
   );
 
-  // Beyond animating the fall, breaking also recolors every shard in that
-  // half to a duller, dustier stone tone and kicks up a dust puff at each
-  // one — cues on top of the motion itself that this is the half the
-  // physics decided would fail.
-  function markBroken(shards) {
-    for (const body of shards) {
-      Body.setStatic(body, false);
-      body.plugin.broken = true;
-      const size = (body.bounds.max.x - body.bounds.min.x + (body.bounds.max.y - body.bounds.min.y)) / 4;
-      dust.spawnBurst(body.position.x, body.position.y, size);
+  // Where the failure starts: for each half that fails, the cell failure.js
+  // says it begins in (the worst-stressed cell for a strength failure,
+  // mid-strut for buckling). The shards let go outward from there, so the
+  // collapse visibly starts where the calculation says it does.
+  const origins = [evaluation.left, evaluation.right]
+    .filter((half) => half.fails && half.origin)
+    .map((half) => ({ x: physicsX(half.origin.cell.elx), y: physicsY(half.origin.cell.ely) }));
+
+  const releaseTimers = new Set();
+  const slowMoTimers = new Set();
+
+  function startSlowMotion() {
+    if (prefersReducedMotion()) return;
+    engine.timing.timeScale = SLOWMO_SCALE;
+    const later = (ms, fn) => {
+      const id = setTimeout(() => {
+        slowMoTimers.delete(id);
+        fn();
+      }, ms);
+      slowMoTimers.add(id);
+    };
+    // The last step is pinned to exactly SLOWMO_RAMP_MS so the clock ends at
+    // precisely 1, however the ramp divides into steps.
+    const steps = Math.ceil(SLOWMO_RAMP_MS / SLOWMO_STEP_MS);
+    for (let i = 0; i <= steps; i++) {
+      const elapsed = Math.min(i * SLOWMO_STEP_MS, SLOWMO_RAMP_MS);
+      later(SLOWMO_HOLD_MS + elapsed, () => {
+        engine.timing.timeScale = SLOWMO_SCALE + (1 - SLOWMO_SCALE) * (elapsed / SLOWMO_RAMP_MS);
+      });
     }
   }
 
-  function releaseShards(shards) {
-    for (const body of shards) Body.setStatic(body, false);
+  let pendingReleases = 0;
+  const flashes = []; // expanding crack rings, drawn in the afterRender hook
+
+  // Frees one shard. A shard in the half that failed also dulls (a cue on top
+  // of the motion) and kicks up dust; the other half is released without
+  // recoloring, since it only fell because it lost its support.
+  function releaseOne(body, broken) {
+    Body.setStatic(body, false);
+    if (broken) body.plugin.broken = true;
+    const size = (body.bounds.max.x - body.bounds.min.x + (body.bounds.max.y - body.bounds.min.y)) / 4;
+    dust.spawnBurst(body.position.x, body.position.y, size);
+  }
+
+  // Releases a half's shards in order of distance from the nearest origin, so
+  // the break travels through the stone instead of everything letting go at once.
+  function scheduleRelease(shards, broken) {
+    for (const body of shards) {
+      const distance = Math.min(...origins.map((o) => Math.hypot(body.position.x - o.x, body.position.y - o.y)));
+      const delay = Math.min(MAX_PROPAGATION_MS, distance / PROPAGATION_PX_PER_MS);
+      pendingReleases++;
+      const id = setTimeout(() => {
+        releaseTimers.delete(id);
+        pendingReleases--;
+        releaseOne(body, broken);
+      }, delay);
+      releaseTimers.add(id);
+    }
   }
 
   // evaluateHalves resolves both halves' fates from ONE simultaneous
@@ -198,23 +287,23 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
 
       hasImpacted = true;
       playImpact(impactIntensity);
-      if (willBreak.left) {
-        triggered.left = true;
-        markBroken(leftShards);
-      }
-      if (willBreak.right) {
-        triggered.right = true;
-        markBroken(rightShards);
-      }
-      if (triggered.left || triggered.right) {
+      if (effects.onImpact) effects.onImpact(willBreak.left || willBreak.right, impactIntensity);
+      if (willBreak.left || willBreak.right) {
+        triggered.left = willBreak.left;
+        triggered.right = willBreak.right;
         playBreak(impactIntensity);
-        // The two halves prop each other up at the apex, so once either
-        // one fails the other has lost its support too — leaving it
-        // frozen in mid-air (as an earlier version did) shows a structure
-        // that couldn't actually stand. Release it without recoloring, so
-        // the dark shards still mark which side actually failed.
-        if (!triggered.left) releaseShards(leftShards);
-        if (!triggered.right) releaseShards(rightShards);
+        startSlowMotion();
+        // The crack starts at each origin: a flash and a burst of dust there.
+        for (const o of origins) {
+          flashes.push({ x: o.x, y: o.y, start: performance.now() });
+          dust.spawnBurst(o.x, o.y, cellWidth * 2.5);
+        }
+        // The two halves prop each other up at the apex, so once either one
+        // fails the other has lost its support too — leaving it frozen in
+        // mid-air (as an earlier version did) shows a structure that couldn't
+        // actually stand.
+        scheduleRelease(leftShards, willBreak.left);
+        scheduleRelease(rightShards, willBreak.right);
       }
     }
   });
@@ -232,6 +321,7 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
     hasSettled() {
       totalFrames++;
       if (totalFrames > MAX_FRAMES) return true;
+      if (pendingReleases > 0) return false; // the break is still travelling: don't call it settled yet
 
       const dynamicBodies = [testBall, ...leftShards, ...rightShards].filter((b) => !b.isStatic);
       const speeds = dynamicBodies.map((b) => Vector.magnitude(b.velocity));
@@ -242,6 +332,11 @@ export function buildCollapseScene({ numElemX, numElemY, densities, u, loadColum
       return triggered.left || triggered.right;
     },
     stop() {
+      for (const id of releaseTimers) clearTimeout(id);
+      releaseTimers.clear();
+      for (const id of slowMoTimers) clearTimeout(id);
+      slowMoTimers.clear();
+      pendingReleases = 0;
       Runner.stop(runner);
       Render.stop(render);
       Composite.clear(world, false);

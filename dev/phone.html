@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Load Path phone simulator (dev only)</title>
+<style>
+  body { font: 14px system-ui; margin: 0; padding: 16px; background: #0b1320; color: #eef2f6; max-width: 420px; }
+  h1 { font-size: 15px; letter-spacing: .15em; text-transform: uppercase; color: #e6c07b; }
+  section { margin: 14px 0; padding-top: 10px; border-top: 1px solid #ffffff22; }
+  button { font: inherit; margin: 3px 3px 3px 0; padding: 8px 12px; border-radius: 8px; border: 1px solid #ffffff33; background: #ffffff14; color: inherit; }
+  label { display: block; margin: 8px 0 2px; color: #8ea3b8; }
+  input[type=range] { width: 100%; }
+  #pad { width: 100%; aspect-ratio: 2 / 1; background: #1a2a3c; border: 1px dashed #ffffff44; touch-action: none; display: block; }
+  pre { color: #8ea3b8; white-space: pre-wrap; }
+</style>
+<h1>Load Path phone (dev simulator)</h1>
+<p>Sends the same messages as footron/controls, over a BroadcastChannel. Open the wall at <code>/web/index.html?ftmsg=1</code> in another tab (served with <code>--dev</code>).</p>
+<section>
+  <button data-lesson="meet">Meet</button><button data-lesson="heavy">Heavy</button><button data-lesson="spot">Spot</button><button data-lesson="stiff">Stiff</button>
+</section>
+<section>
+  <label>Stone <span id="stoneV">620</span> kg</label><input id="stone" type="range" min="230" max="1560" step="10" value="620">
+  <label>Test weight (0..1)</label><input id="weight" type="range" min="0" max="1" step="0.001" value="0.6">
+  <label>Spot (0..1)</label><input id="spot" type="range" min="0" max="1" step="0.01" value="0.5">
+  <button id="grow">Grow</button><button id="skip">Skip</button><button id="test">Test</button><button id="replay">Replay</button>
+  <label>Scrub</label><input id="scrub" type="range" min="0" max="1" step="0.01" value="1">
+</section>
+<section>
+  <button id="turn">Your turn</button><button id="back">Back</button><button id="clear">Clear</button><button id="reveal">Reveal</button>
+  <button id="mine">Test mine</button><button id="save">Save</button><button id="best1">Load best #1</button>
+  <label>Brush <span id="brushV">1</span></label><input id="brush" type="range" min="0" max="4" step="1" value="1">
+  <label><input id="erase" type="checkbox"> erase</label>
+  <canvas id="pad" width="600" height="300"></canvas>
+</section>
+<pre id="log"></pre>
+<script>
+  const channel = new BroadcastChannel("loadpath-dev");
+  const log = document.getElementById("log");
+  const send = (body) => { channel.postMessage(body); log.textContent = JSON.stringify(body) + "\n" + log.textContent.slice(0, 400); };
+  window.send = send; // so a test can drive it
+  const $ = (id) => document.getElementById(id);
+  document.querySelectorAll("[data-lesson]").forEach((b) => b.onclick = () => send({ type: "lesson", value: b.dataset.lesson }));
+  $("stone").oninput = (e) => { $("stoneV").textContent = e.target.value; send({ type: "setup", key: "stone", value: Number(e.target.value) }); };
+  $("weight").oninput = (e) => send({ type: "setup", key: "weight", value: Number(e.target.value) });
+  $("spot").oninput = (e) => send({ type: "setup", key: "spot", value: Number(e.target.value) });
+  $("grow").onclick = () => send({ type: "grow" });
+  $("skip").onclick = () => send({ type: "skip" });
+  $("test").onclick = () => send({ type: "test" });
+  $("replay").onclick = () => send({ type: "replay" });
+  $("scrub").oninput = (e) => send({ type: "scrub", value: Number(e.target.value) });
+  $("turn").onclick = () => send({ type: "yourTurn", value: true });
+  $("back").onclick = () => send({ type: "yourTurn", value: false });
+  $("clear").onclick = () => send({ type: "clear" });
+  let revealed = false;
+  $("reveal").onclick = () => { revealed = !revealed; send({ type: "reveal", value: revealed }); };
+  $("mine").onclick = () => send({ type: "testMine" });
+  $("save").onclick = () => send({ type: "save" });
+  $("best1").onclick = () => send({ type: "loadBest", value: 1 });
+  $("brush").oninput = (e) => { $("brushV").textContent = e.target.value; send({ type: "brush", value: Number(e.target.value) }); };
+  const pad = $("pad");
+  const at = (e) => { const r = pad.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; };
+  let down = false;
+  pad.onpointerdown = (e) => { down = true; pad.setPointerCapture(e.pointerId); send({ type: "paint", ...at(e), erase: $("erase").checked }); };
+  pad.onpointermove = (e) => { if (down) send({ type: "paint", ...at(e), erase: $("erase").checked }); };
+  pad.onpointerup = () => { down = false; send({ type: "stroke", value: "end" }); };
+</script>

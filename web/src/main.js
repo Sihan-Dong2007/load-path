@@ -1,10 +1,12 @@
 import { nodeId, nodeDofs } from "./mesh.js";
 import { iterateTopologyOptimization } from "./optimize.js";
-import { renderDensities } from "./render.js";
+import { renderDensities, renderStress } from "./render.js";
 import * as report from "./report.js";
 import { playGrowth, showFrame } from "./growth.js";
-import { loadCapacityKg } from "./failure.js";
+import { loadLimit, evaluateHalves, stressRatioMap } from "./failure.js";
 import * as challenge from "./challenge.js";
+import { LESSONS, weightToSliderValue } from "./lessons.js";
+import { connectFootron, footronEnabled, spotToColumn } from "./footron.js";
 import { paintBackdrop, paintWaterOverlay } from "./backdrop.js";
 import { DOMAIN, SCENE_W, SCENE_H } from "./scene.js";
 import { buildCollapseScene } from "./collapse.js";
@@ -30,10 +32,43 @@ paintBackdrop(document.getElementById("backdrop"));
 paintWaterOverlay(document.getElementById("overlay"));
 
 const sceneEl = document.getElementById("scene");
+const reportEl = document.getElementById("report");
+const challengeEl = document.getElementById("challenge");
+const panelEl = document.getElementById("panel");
+let sceneScale = 1;
+function applySceneTransform(dx, dy) {
+  sceneEl.style.transform = `translate(-50%, -50%) translate(${dx}px, ${dy}px) scale(${sceneScale})`;
+}
+
+// A short camera shake on impact, decaying to nothing. Skipped for people who
+// ask their system for reduced motion.
+let shakeToken = 0;
+function shakeScene(amplitudePx, durationMs) {
+  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const token = ++shakeToken;
+  const start = performance.now();
+  (function frame() {
+    if (token !== shakeToken) return;
+    const t = (performance.now() - start) / durationMs;
+    if (t >= 1) {
+      applySceneTransform(0, 0);
+      return;
+    }
+    const decay = (1 - t) ** 2;
+    applySceneTransform((Math.random() * 2 - 1) * amplitudePx * decay, (Math.random() * 2 - 1) * amplitudePx * decay);
+    requestAnimationFrame(frame);
+  })();
+}
+
+// The scene always fills the window at full size — it does NOT shrink to make
+// room for the side panels. Instead the panels themselves are see-through
+// (index.html: low background alpha, and pointer-events disabled on their
+// empty space — see the CSS comment there) so a support corner sitting under
+// one is still visible and still clickable.
 function fitScene() {
-  const scale = Math.min(window.innerWidth / SCENE_W, window.innerHeight / SCENE_H);
-  sceneEl.style.transform = `translate(-50%, -50%) scale(${scale})`;
   document.documentElement.style.setProperty("--ui", String(Math.min(1.3, Math.max(0.85, window.innerWidth / 1700))));
+  sceneScale = Math.min(window.innerWidth / SCENE_W, window.innerHeight / SCENE_H);
+  applySceneTransform(0, 0);
 }
 fitScene();
 window.addEventListener("resize", fitScene);
@@ -44,7 +79,6 @@ const weightSlider = document.getElementById("weight-slider");
 const weightLabel = document.getElementById("weight-label");
 const messageEl = document.getElementById("message");
 const handle = document.getElementById("load-handle");
-const panelEl = document.getElementById("panel");
 
 document.getElementById("collapse").addEventListener("click", (event) => {
   const collapsed = panelEl.classList.toggle("collapsed");
@@ -106,10 +140,55 @@ let lastU = null; // field, cached so changing just the test weight
 let lastMaterialKg = null; // doesn't re-grow the structure
 
 const FINAL_HOLD_MS = 1800;
+
+// --- Guided lessons: a lesson sets the stone, the weight and the spot, runs
+// the whole thing, and says something once the test is over. Any manual change
+// to the sliders or a fresh drop ends the lesson, since its closing words are
+// only true for the exact setup it verified (see check-lessons.js). ---
+let activeLesson = null;
+const lessonChips = document.getElementById("lesson-chips");
+const lessonText = document.getElementById("lesson-text");
+
+function showLesson(lesson, body) {
+  for (const chip of lessonChips.children) chip.classList.toggle("on", lesson !== null && chip.dataset.id === lesson.id);
+  lessonText.hidden = lesson === null;
+  if (lesson) {
+    document.getElementById("lesson-title").textContent = lesson.title;
+    document.getElementById("lesson-body").textContent = body;
+  }
+}
+
+function clearLesson() {
+  activeLesson = null;
+  showLesson(null);
+}
+
+function startLesson(lesson) {
+  materialSlider.value = String(lesson.material);
+  weightSlider.value = String(weightToSliderValue(lesson.weightKg, WEIGHT_EXPONENT_MIN, WEIGHT_EXPONENT_MAX, WEIGHT_SLIDER_MAX));
+  updateLabels();
+  runFullCycle(lesson.column, lesson);
+}
+
+// Called with the verdict of a finished test; only speaks if it still belongs to the lesson.
+function lessonInsight(broke) {
+  if (!activeLesson) return;
+  const words = broke ? activeLesson.afterBreaks : activeLesson.afterHolds;
+  if (words) showLesson(activeLesson, words);
+}
+
+for (const lesson of LESSONS) {
+  const chip = document.createElement("button");
+  chip.textContent = lesson.title;
+  chip.dataset.id = lesson.id;
+  chip.addEventListener("click", () => startLesson(lesson));
+  lessonChips.appendChild(chip);
+}
 const REPLAY_FRAME_MS = 260;
 
 let lastPlayback = null; // every recorded iteration of the current run, for scrubbing/replay
 let lastCapacityKg = null; // what the finished bridge can carry, exactly (failure.js)
+let lastLimit = null; // ...and what limits it: { kg, mode, side }
 const skip = { requested: false }; // "Skip" during the step-by-step explanation
 
 function stopEverything() {
@@ -120,8 +199,10 @@ function stopEverything() {
   }
 }
 
-async function runFullCycle(loadColumn) {
+async function runFullCycle(loadColumn, lesson = null) {
   challenge.leave();
+  activeLesson = lesson;
+  showLesson(lesson, lesson ? lesson.intro : "");
   report.showReport();
   stopEverything();
   const token = currentRunToken;
@@ -152,15 +233,51 @@ async function runFullCycle(loadColumn) {
   lastU = final.u;
   lastMaterialKg = materialKg;
 
-  lastCapacityKg = loadCapacityKg({ numElemX, numElemY, densities: final.densities, u: final.u, loadColumn });
+  const limit = loadLimit({ numElemX, numElemY, densities: final.densities, u: final.u, loadColumn });
+  lastCapacityKg = limit.kg;
+  lastLimit = limit;
   showResult();
   report.setScrubber({ max: playback.frames.length + 1, value: playback.frames.length + 1, enabled: true });
 
-  // Hold the finished heat map for a moment before the test starts, so
-  // there's time to see where the finished bridge is carrying load.
+  // Before the test, show where the finished bridge is closest to breaking AT
+  // THE TEST WEIGHT: the crack in the test will start at the reddest stone.
+  showStress();
   await new Promise((resolve) => setTimeout(resolve, FINAL_HOLD_MS));
   if (isCancelled()) return;
   startCollapseTest(token, final.densities, final.u, loadColumn, materialKg);
+}
+
+const LIMIT_TEXT = {
+  tension: "stone pulled apart",
+  buckling: "a leg bowing sideways",
+  crushing: "stone crushed",
+};
+
+// Draws the finished bridge colored by stress at the current test weight and
+// says, in one line, where and how it will start to fail (or how much margin
+// it has).
+function showStress() {
+  if (!lastPlayback) return;
+  const { final } = lastPlayback;
+  const args = { numElemX, numElemY, densities: final.densities, u: final.u, loadColumn: lastLoadColumn };
+  const test = getWeightKg();
+  lastPlayback.stressRatios = stressRatioMap({ ...args, testWeightKg: test });
+  report.setLegend("stress");
+  renderStress(ctx, final.densities, lastPlayback.stressRatios);
+
+  const evaluation = evaluateHalves({ ...args, testWeightKg: test });
+  const kg = `${Math.round(test).toLocaleString()} kg`;
+  const failing = evaluation.ok ? [evaluation.left, evaluation.right].find((half) => half.fails) : null;
+  const worst = evaluation.ok ? Math.max(evaluation.left.stressRatio, evaluation.right.stressRatio) : 0;
+  report.setNote(
+    !evaluation.ok
+      ? "Not connected: nothing carries the load."
+      : failing && failing.origin.kind === "tension"
+        ? `At ${kg} the reddest stone is over its limit. The crack starts there.`
+        : failing
+          ? `At ${kg} a whole leg ${failing.origin.kind === "buckling" ? "buckles (bows sideways)" : "crushes"} before the stone cracks, starting mid-leg.`
+          : `At ${kg} the hottest stone is at ${Math.round(worst * 100)}% of its limit. It holds.`
+  );
 }
 
 // The capacity readout: what the finished shape holds, how efficiently it uses
@@ -170,6 +287,7 @@ function showResult() {
   const test = getWeightKg();
   report.showResult({
     holds: capacity === 0 ? "nothing: not connected" : Number.isFinite(capacity) ? formatWeightKg(capacity) : "no limit found",
+    limit: lastLimit && lastLimit.mode ? LIMIT_TEXT[lastLimit.mode] : "\u2014",
     efficiency: capacity > 0 && Number.isFinite(capacity) ? `${Math.round(capacity / lastMaterialKg).toLocaleString()} kg per kg of stone` : "\u2014",
     ...safetyText(capacity, test),
   });
@@ -242,6 +360,7 @@ function enterChallenge() {
     fixedDofs,
     loadColumn: lastLoadColumn,
     volumeFraction: kgToVolumeFraction(lastMaterialKg),
+    materialKg: lastMaterialKg,
     algorithm: { densities: lastPlayback.final.densities, u: lastPlayback.final.u, capacity: lastCapacityKg },
     evenSpreadCompliance: lastPlayback.frames[0].compliance,
     deformScale: lastPlayback.scale,
@@ -272,21 +391,34 @@ report.bindControls({
     skip.requested = true;
     report.setSkipVisible(false);
   },
-  onTest: () => {
-    if (lastPlayback) {
-      report.setMarker(lastPlayback.frames.length + 1);
-      showFrame(ctx, lastPlayback, lastPlayback.frames.length + 1);
-    }
-    retest();
-  },
+  onTest: testAgain,
 });
+
+function testAgain() {
+  if (lastPlayback) {
+    report.setMarker(lastPlayback.frames.length + 1);
+    showFrame(ctx, lastPlayback, lastPlayback.frames.length + 1);
+  }
+  retest();
+}
 
 function startCollapseTest(token, densities, u, loadColumn, materialKg) {
   if (token !== currentRunToken) return;
 
   const testWeightKg = getWeightKg();
-  const scene = buildCollapseScene({ numElemX, numElemY, densities, u, loadColumn, testWeightKg, canvas });
+  const scene = buildCollapseScene({
+    numElemX,
+    numElemY,
+    densities,
+    u,
+    loadColumn,
+    testWeightKg,
+    canvas,
+    // Hard when something breaks, a light thud when it holds.
+    effects: { onImpact: (broke, intensity) => shakeScene(broke ? 8 + 18 * intensity : 2 + 5 * intensity, broke ? 520 : 240) },
+  });
   if (!scene.ok) {
+    onRunFinished();
     panelEl.classList.remove("busy");
     setMessage(`${materialKg}kg of stone can't even form a structure here — try more stone, or a different spot.`);
     return;
@@ -306,6 +438,8 @@ function startCollapseTest(token, densities, u, loadColumn, materialKg) {
       } else {
         setMessage(`It held ${testWeightKg}kg. Try less stone, or a different spot.`);
       }
+      lessonInsight(scene.collapsed());
+      onRunFinished();
       return;
     }
     requestAnimationFrame(poll);
@@ -327,6 +461,8 @@ function retest() {
   playing = false;
   report.setPlaying(false);
   if (lastCapacityKg !== null) report.updateSafety(safetyText(lastCapacityKg, getWeightKg()));
+  const { final } = lastPlayback;
+  lastPlayback.stressRatios = stressRatioMap({ numElemX, numElemY, densities: final.densities, u: final.u, loadColumn: lastLoadColumn, testWeightKg: getWeightKg() });
   startCollapseTest(token, lastDensities, lastU, lastLoadColumn, lastMaterialKg);
 }
 
@@ -338,6 +474,7 @@ setMessage("Drag the weight onto the block to begin.");
 
 materialSlider.addEventListener("input", updateLabels);
 materialSlider.addEventListener("change", () => {
+  clearLesson();
   updateLabels();
   if (lastLoadColumn !== null) runFullCycle(lastLoadColumn);
 });
@@ -348,6 +485,7 @@ materialSlider.addEventListener("change", () => {
 // changed.
 weightSlider.addEventListener("input", updateLabels);
 weightSlider.addEventListener("change", () => {
+  clearLesson();
   updateLabels();
   retest();
 });
@@ -432,4 +570,102 @@ handle.addEventListener("pointerdown", (event) => {
   window.addEventListener("pointermove", onDragMove);
   window.addEventListener("pointerup", onDragUp);
   window.addEventListener("pointercancel", onDragUp);
+});
+
+
+// ===== The wall: phone controls and the unattended loop =====
+//
+// On the Footron wall nobody can touch the page, so a visitor's phone drives
+// it (footron.js). When no one has for IDLE_MS, the wall plays the lessons on
+// its own, one after another, until the next message or touch arrives.
+
+const onWall = footronEnabled() || /[?&]attract=1/.test(location.search);
+const IDLE_MS = 45000;
+const ATTRACT_HOLD_MS = 9000; // how long to linger on a finished lesson
+let attracting = false;
+let idleTimer = null;
+let attractTimer = null;
+let attractIndex = 0;
+const attractBanner = document.getElementById("attract");
+
+function attractStep() {
+  if (!attracting) return;
+  startLesson(LESSONS[attractIndex++ % LESSONS.length]);
+}
+
+// The current run is over; if the wall is playing on its own, line up the next lesson.
+function onRunFinished() {
+  if (!attracting) return;
+  clearTimeout(attractTimer);
+  attractTimer = setTimeout(attractStep, ATTRACT_HOLD_MS);
+}
+
+function startAttract() {
+  attracting = true;
+  attractBanner.hidden = false;
+  attractStep();
+}
+
+// Anyone touching anything ends the unattended loop and restarts the idle clock.
+function bumpActivity() {
+  if (!onWall) return;
+  attracting = false;
+  clearTimeout(attractTimer);
+  attractBanner.hidden = true;
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(startAttract, IDLE_MS);
+}
+
+if (onWall) {
+  document.body.classList.add("wall");
+  for (const type of ["pointerdown", "keydown", "input"]) window.addEventListener(type, bumpActivity, true);
+  bumpActivity();
+}
+
+// The pending setup a phone builds up before saying "grow". The sliders are the
+// source of truth for stone and weight, so the labels on the wall follow along.
+let pendingSpot = 0.5;
+
+connectFootron({
+  onActivity: bumpActivity,
+  onSetup(key, value) {
+    if (key === "stone") materialSlider.value = String(Math.round(value / 10) * 10);
+    else if (key === "weight") weightSlider.value = String(Math.round(value * WEIGHT_SLIDER_MAX));
+    else pendingSpot = value;
+    clearLesson();
+    updateLabels();
+  },
+  onGrow(setup) {
+    if (setup.stone !== undefined) materialSlider.value = String(Math.round(setup.stone / 10) * 10);
+    if (setup.weight !== undefined) weightSlider.value = String(Math.round(setup.weight * WEIGHT_SLIDER_MAX));
+    if (setup.spot !== undefined) pendingSpot = setup.spot;
+    clearLesson();
+    updateLabels();
+    runFullCycle(spotToColumn(pendingSpot, numElemX));
+  },
+  onLesson(id) {
+    const lesson = LESSONS.find((l) => l.id === id);
+    if (lesson) startLesson(lesson);
+  },
+  onSkip() {
+    skip.requested = true;
+    report.setSkipVisible(false);
+  },
+  onScrub(fraction) {
+    if (lastPlayback) scrubTo(1 + Math.round(fraction * lastPlayback.frames.length));
+  },
+  onReplay: togglePlay,
+  onTest: testAgain,
+  onYourTurn(open) {
+    if (open && !challenge.isActive()) enterChallenge();
+    else if (!open) challenge.exit();
+  },
+  onPaint: (x, y, erase) => challenge.paintFraction(x, y, erase),
+  onStrokeEnd: challenge.endStroke,
+  onBrush: challenge.setBrushSize,
+  onClear: challenge.clearDesign,
+  onReveal: challenge.setRevealed,
+  onTestMine: challenge.testMine,
+  onSave: challenge.saveMine,
+  onLoadBest: challenge.loadBest,
 });

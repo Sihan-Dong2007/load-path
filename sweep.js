@@ -31,7 +31,7 @@ function outcome(shape, loadColumn, weightKg) {
   const result = evaluateHalves({ numElemX, numElemY, densities: shape.densities, u: shape.u, loadColumn, testWeightKg: weightKg });
   if (!result.ok) return "disc. ";
   if (!result.left.fails && !result.right.fails) return "holds ";
-  const reason = (h) => (h.bucklingFails ? "buckle" : h.strengthFails ? "stress" : "-");
+  const reason = (h) => (h.bucklingFails ? "buckle" : h.strengthFails ? "stress" : h.crushingFails ? "crush" : "-");
   return `BREAK(L:${reason(result.left)}/R:${reason(result.right)})`;
 }
 

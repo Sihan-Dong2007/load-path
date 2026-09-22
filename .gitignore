@@ -1,2 +1,4 @@
-node_modules/
 .DS_Store
+dev/build/
+dev/node_modules/
+node_modules/

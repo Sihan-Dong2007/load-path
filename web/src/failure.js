@@ -2,7 +2,7 @@ import { findConnectedPath } from "./connectivity.js";
 import { elementDofs } from "./mesh.js";
 import { maxPrincipalStress } from "./stress.js";
 import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from "./buckling.js";
-import { kgToNewtons, stressScaleFactor, STONE_TENSILE_STRENGTH_PA, STONE_ELASTIC_MODULUS_PA, BRIDGE_SPAN_M, BRIDGE_RISE_M, BRIDGE_DEPTH_M } from "./units.js";
+import { kgToNewtons, stressScaleFactor, STONE_TENSILE_STRENGTH_PA, STONE_COMPRESSIVE_STRENGTH_PA, STONE_ELASTIC_MODULUS_PA, BRIDGE_SPAN_M, BRIDGE_RISE_M, BRIDGE_DEPTH_M } from "./units.js";
 
 const DENSITY_THRESHOLD = 0.5;
 
@@ -59,17 +59,47 @@ export function halfGeometry(numElemX, numElemY, densities, columnFilter, suppor
 // turns into a real, dimensionless one by multiplying by the real force
 // (N) AND stressScaleFactor (1 / (thickness x element size), see
 // units.js). >1 means failure.
+function cellStressRatioPerNewton(numElemX, densities, u, cell) {
+  const u_e = elementDofs(cell.elx, cell.ely, numElemX).map((dof) => u[dof]);
+  const stressPerNewton = maxPrincipalStress(u_e, 1, 0.3);
+  const capacity = STONE_TENSILE_STRENGTH_PA * densities[cell.ely][cell.elx]; // porous-material scaling, as used throughout
+  return capacity > 0 ? stressPerNewton / capacity : 0;
+}
+
+// Returns the worst ratio AND the cell it happens in — where a strength
+// failure would start.
 function worstStressToCapacityRatio(numElemX, densities, u, cells) {
   let worst = 0;
+  let worstCell = cells[0];
   for (const cell of cells) {
-    const u_e = elementDofs(cell.elx, cell.ely, numElemX).map((dof) => u[dof]);
-    const stressPerNewton = maxPrincipalStress(u_e, 1, 0.3);
-    const density = densities[cell.ely][cell.elx];
-    const capacity = STONE_TENSILE_STRENGTH_PA * density; // porous-material scaling, as used throughout
-    if (capacity <= 0) continue;
-    worst = Math.max(worst, stressPerNewton / capacity);
+    const ratio = cellStressRatioPerNewton(numElemX, densities, u, cell);
+    if (ratio > worst) {
+      worst = ratio;
+      worstCell = cell;
+    }
   }
-  return worst;
+  return { worst, cell: worstCell };
+}
+
+// The solid cell nearest the middle of a half's support-to-load line: where a
+// strut that buckles or crushes bows out the most, since neither has a single
+// weakest element to blame.
+function midCell(half) {
+  const midX = (half.bottomCell.elx + half.topCell.elx) / 2;
+  const midY = (half.bottomCell.ely + half.topCell.ely) / 2;
+  return closestCell(half.cells, midX, midY);
+}
+
+// The stress ratio of every solid cell at a given test weight — the map of
+// how close each bit of stone is to its tensile limit (1 = at the limit). It
+// is the very same per-cell number the strength check takes the maximum of,
+// so its maximum IS the strength ratio evaluateHalves reports.
+export function stressRatioMap({ numElemX, numElemY, densities, u, testWeightKg }) {
+  const cellWidthM = Math.min(BRIDGE_SPAN_M / numElemX, BRIDGE_RISE_M / numElemY);
+  const scale = kgToNewtons(testWeightKg) * stressScaleFactor(cellWidthM);
+  return densities.map((row, ely) =>
+    row.map((density, elx) => (density > DENSITY_THRESHOLD ? Math.max(0, cellStressRatioPerNewton(numElemX, densities, u, { elx, ely })) * scale : 0))
+  );
 }
 
 // Whether each half holds under a given real test weight — checking BOTH
@@ -98,8 +128,8 @@ export function evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, t
   const axial = resolveTrussAxialForces(left.angle, right.angle, appliedForceN);
 
   function evaluateOne(half, axialForceN) {
-    const stressRatio =
-      worstStressToCapacityRatio(numElemX, densities, u, half.cells) * appliedForceN * stressScaleFactor(half.cellWidthM);
+    const worstStress = worstStressToCapacityRatio(numElemX, densities, u, half.cells);
+    const stressRatio = worstStress.worst * appliedForceN * stressScaleFactor(half.cellWidthM);
     const strengthFails = stressRatio > 1;
 
     const totalDensitySum = half.cells.reduce((sum, cell) => sum + densities[cell.ely][cell.elx], 0);
@@ -111,7 +141,35 @@ export function evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, t
     const criticalLoadN = eulerCriticalLoad(STONE_ELASTIC_MODULUS_PA, momentOfInertia, half.lengthM);
     const bucklingFails = axialForceN > 0 && axialForceN > criticalLoadN;
 
-    return { fails: strengthFails || bucklingFails, strengthFails, bucklingFails, stressRatio, axialForceN, criticalLoadN };
+    // Crushing: the strut's compressive force over its mean cross-section,
+    // against stone's compressive strength. Deliberately NOT a per-element
+    // FEM check like the tension one: a point load or a pinned support makes
+    // the compressive stress in the one element beside it a mesh-dependent
+    // singularity (it grows as the mesh is refined), which would drag every
+    // design's capacity down to the same meaningless number. The mean section
+    // is the same idealization the buckling check uses.
+    const crossSectionM2 = avgWidthM * BRIDGE_DEPTH_M;
+    const crushingStressPa = axialForceN > 0 ? axialForceN / crossSectionM2 : 0;
+    const crushingFails = crushingStressPa > STONE_COMPRESSIVE_STRENGTH_PA;
+
+    const fails = strengthFails || bucklingFails || crushingFails;
+    // Where it starts to go. A strength failure starts at the worst-stressed
+    // cell; a buckling or crushing failure has no single weakest element, so
+    // it starts mid-strut, where the strut bows out the most.
+    const origin = !fails ? null : strengthFails ? { cell: worstStress.cell, kind: "tension" } : { cell: midCell(half), kind: bucklingFails ? "buckling" : "crushing" };
+
+    return {
+      fails,
+      origin,
+      strengthFails,
+      bucklingFails,
+      crushingFails,
+      stressRatio,
+      axialForceN,
+      criticalLoadN,
+      crossSectionM2,
+      crushingStressPa,
+    };
   }
 
   return {
@@ -121,23 +179,36 @@ export function evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, t
   };
 }
 
-// The heaviest test weight (kg) this shape holds — exactly, not by search.
-// The stress ratio and the truss axial force are both linear in the applied
-// force, and the buckling limit doesn't depend on it, so evaluating once at a
-// reference weight gives every threshold in closed form: the strength limit
-// is reference / stressRatio, the buckling limit reference * critical / axial.
-// evaluateHalves fails a half exactly when its ratio exceeds 1 or axial
-// exceeds critical, so a weight above this capacity fails and one below holds.
-// 0 for a shape whose halves aren't connected; Infinity if nothing limits it.
-export function loadCapacityKg({ numElemX, numElemY, densities, u, loadColumn }) {
+// The heaviest test weight (kg) this shape holds — exactly, not by search —
+// and what limits it. The stress ratio, the truss axial force and the
+// crushing stress are all linear in the applied force, and the buckling and
+// crushing limits don't depend on it, so evaluating once at a reference
+// weight gives every threshold in closed form: strength = reference /
+// stressRatio, buckling = reference * critical / axial, crushing = reference
+// * (strength * area) / axial. evaluateHalves fails a half exactly when any
+// ratio exceeds 1, so a weight above the capacity fails and one below holds.
+// kg is 0 for a shape whose halves aren't connected, Infinity if nothing
+// limits it. mode is "tension", "buckling" or "crushing".
+export function loadLimit({ numElemX, numElemY, densities, u, loadColumn }) {
   const REFERENCE_KG = 1000;
   const result = evaluateHalves({ numElemX, numElemY, densities, u, loadColumn, testWeightKg: REFERENCE_KG });
-  if (!result.ok) return 0;
+  if (!result.ok) return { kg: 0, mode: null, side: null };
 
-  const limits = [result.left, result.right].map((half) => {
-    const byStrength = half.stressRatio > 0 ? REFERENCE_KG / half.stressRatio : Infinity;
-    const byBuckling = half.axialForceN > 0 ? (REFERENCE_KG * half.criticalLoadN) / half.axialForceN : Infinity;
-    return Math.min(byStrength, byBuckling);
-  });
-  return Math.min(...limits);
+  let best = { kg: Infinity, mode: null, side: null };
+  for (const [side, half] of [["left", result.left], ["right", result.right]]) {
+    const limits = [
+      ["tension", half.stressRatio > 0 ? REFERENCE_KG / half.stressRatio : Infinity],
+      ["buckling", half.axialForceN > 0 ? (REFERENCE_KG * half.criticalLoadN) / half.axialForceN : Infinity],
+      [
+        "crushing",
+        half.axialForceN > 0 ? (REFERENCE_KG * STONE_COMPRESSIVE_STRENGTH_PA * half.crossSectionM2) / half.axialForceN : Infinity,
+      ],
+    ];
+    for (const [mode, kg] of limits) if (kg < best.kg) best = { kg, mode, side };
+  }
+  return best;
+}
+
+export function loadCapacityKg(params) {
+  return loadLimit(params).kg;
 }

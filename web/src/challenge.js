@@ -10,12 +10,14 @@ import { computeElementWork } from "./sensitivity.js";
 import { renderDensities, renderDeformed, normalizeHeat } from "./render.js";
 import { loadCapacityKg } from "./failure.js";
 import { MAX_MATERIAL_KG } from "./units.js";
-import { createDesign, countCells, budgetCells, paintBrush, toDensities, supportsConnected, connectionStatus, connectionHint } from "./design.js";
+import { setupKey, encodeDesign, decodeDesign, loadBoard, addResult } from "./storage.js";
+import { createDesign, countCells, budgetCells, paintBrush, toDensities, supportsConnected, connectionStatus, connectionHint, nearbyRequiredCells } from "./design.js";
 
 const $ = (id) => document.getElementById(id);
 const card = $("challenge");
 
 const SOLVE_DELAY_MS = 220; // solve once the visitor pauses, never mid-stroke
+const PHONE_SNAP_CELLS = 4; // half a fingertip (~7 cells wide on a phone pad): how close a stroke must pass to a required cell to fill it in
 const MAX_DRAWN_SAG = 0.3; // a very soft design is drawn sagging at most this fraction of the domain height
 
 let host = null;
@@ -211,6 +213,7 @@ function updateReadout() {
     verdict.className = stiffer ? "win" : "";
   }
   $("ch-test").disabled = !(result && result.connected) && !testing;
+  $("ch-save").disabled = !(result && result.connected);
 }
 
 // Solve the visitor's bridge with the same model the optimizer used.
@@ -313,6 +316,155 @@ function setTesting(value) {
   updateReadout();
 }
 
+// localStorage can throw just by being touched (blocked site data), so it is only
+// handed to storage.js, which guards every call.
+function browserStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return { getItem: () => null, setItem: () => {} };
+  }
+}
+
+function boardKey() {
+  return setupKey(host.materialKg, host.loadColumn);
+}
+
+// The best bridges saved for this exact stone and spot; click one to load it.
+function renderBoard() {
+  const list = $("ch-board-list");
+  list.replaceChildren();
+  const board = loadBoard(browserStorage(), boardKey());
+  $("ch-board-title").textContent = `Best for ${host.materialKg} kg at this spot`;
+  if (board.length === 0) {
+    const empty = document.createElement("div");
+    empty.id = "ch-board-empty";
+    empty.textContent = "Nothing saved yet. Build a bridge and save it.";
+    list.appendChild(empty);
+    return;
+  }
+  board.forEach((entry, i) => {
+    const button = document.createElement("button");
+    button.title = "Load this bridge into the editor";
+    button.innerHTML = '<span class="rank"></span><span class="kg"></span><span class="sag"></span>';
+    button.children[0].textContent = `#${i + 1}`;
+    button.children[1].textContent = `${Math.round(entry.capacityKg).toLocaleString()} kg`;
+    button.children[2].textContent = `sag ${entry.sagPct}%`;
+    button.addEventListener("click", () => loadSaved(entry));
+    list.appendChild(button);
+  });
+}
+
+function loadSaved(entry) {
+  const loaded = decodeDesign(entry.cells, host.numElemX, host.numElemY);
+  if (!loaded || testing) return;
+  design = loaded;
+  scheduleEvaluate();
+  redraw();
+  updateReadout();
+}
+
+function saveCurrent() {
+  if (!result || !result.connected) return;
+  const { board, rank } = addResult(browserStorage(), boardKey(), {
+    capacityKg: result.capacity,
+    sagPct: Math.round((result.sag / host.evenSpreadCompliance) * 100),
+    cells: encodeDesign(design),
+    when: Date.now(),
+  });
+  renderBoard();
+  const verdict = $("ch-verdict");
+  verdict.className = rank === 1 ? "win" : "";
+  verdict.textContent =
+    rank === null
+      ? `Saved, but the ${board.length} best bridges for this setup all hold more.`
+      : rank === 1
+        ? "Saved as the best bridge for this setup!"
+        : `Saved as #${rank} for this setup.`;
+}
+
+// --- The editor's actions. The buttons and the phone (footron.js) both call
+// these, so a phone can do exactly what the buttons on the card do. ---
+
+export function clearDesign() {
+  if (!host) return;
+  if (testing) host.stopTest();
+  setTesting(false);
+  resetDesign();
+  redraw();
+  updateReadout();
+}
+
+export function setRevealed(value) {
+  if (!host) return;
+  showGhost = value;
+  $("ch-reveal").textContent = showGhost ? "Hide algorithm" : "Reveal algorithm";
+  redraw();
+}
+
+// Drop the weight on the visitor's bridge, or go back to editing it.
+export function testMine() {
+  if (!host) return;
+  if (testing) {
+    host.stopTest();
+    setTesting(false);
+  } else if (result && result.connected) {
+    setTesting(true);
+    host.runTest(result.densities, result.u);
+  }
+}
+
+export function saveMine() {
+  if (host) saveCurrent();
+}
+
+export function loadBest(rank) {
+  if (!host) return;
+  const entry = loadBoard(browserStorage(), boardKey())[rank - 1];
+  if (entry) loadSaved(entry);
+}
+
+export function setBrushSize(size) {
+  if (host) setBrush(size);
+}
+
+// A point of a stroke from the phone: x and y are fractions of the design area
+// (y from the top), so the phone never needs to know the grid size. Consecutive
+// points are joined, like a finger dragging on the wall itself.
+let phoneLast = null;
+export function paintFraction(x, y, erase) {
+  if (!host || testing) return;
+  const cell = {
+    elx: Math.min(host.numElemX - 1, Math.floor(x * host.numElemX)),
+    ely: host.numElemY - 1 - Math.min(host.numElemY - 1, Math.floor(y * host.numElemY)),
+  };
+  if (phoneLast) paintLine(phoneLast, cell, erase);
+  else paintAt(cell, erase);
+  // A fingertip can't land on one 5px grid cell, so a stroke that passes near a
+  // corner cell or the spot under the weight is extended to it with a painted
+  // line -- not just a single isolated cell, which would satisfy the "has
+  // stone" check without actually joining it to the rest of the stroke.
+  if (!erase) for (const required of nearbyRequiredCells(design, host.loadColumn, cell, PHONE_SNAP_CELLS)) paintLine(cell, required, false);
+  phoneLast = cell;
+  hover = cell;
+  redraw();
+  updateReadout();
+}
+
+export function endStroke() {
+  phoneLast = null;
+  hover = null;
+  if (host) redraw();
+}
+
+// Leaves the editor and returns to the algorithm's bridge (the "Back" button).
+export function exit() {
+  if (!host) return;
+  const callback = host.onExit;
+  leave();
+  callback();
+}
+
 let bound = false;
 function bindOnce() {
   if (bound) return;
@@ -323,33 +475,15 @@ function bindOnce() {
     eraseMode = !eraseMode;
     $("ch-erase").classList.toggle("on", eraseMode);
   });
-  $("ch-clear").addEventListener("click", () => {
-    if (testing) host.stopTest();
-    testing = false;
-    setTesting(false);
-    resetDesign();
-    redraw();
-    updateReadout();
+  $("ch-clear").addEventListener("click", clearDesign);
+  $("ch-reveal").addEventListener("click", () => setRevealed(!showGhost));
+  $("ch-test").addEventListener("click", testMine);
+  $("ch-save").addEventListener("click", saveCurrent);
+  $("ch-collapse").addEventListener("click", (event) => {
+    const collapsed = card.classList.toggle("collapsed");
+    event.currentTarget.textContent = collapsed ? "+" : "–";
   });
-  $("ch-reveal").addEventListener("click", () => {
-    showGhost = !showGhost;
-    $("ch-reveal").textContent = showGhost ? "Hide algorithm" : "Reveal algorithm";
-    redraw();
-  });
-  $("ch-test").addEventListener("click", () => {
-    if (testing) {
-      host.stopTest();
-      setTesting(false);
-    } else if (result && result.connected) {
-      setTesting(true);
-      host.runTest(result.densities, result.u);
-    }
-  });
-  $("ch-back").addEventListener("click", () => {
-    const callback = host.onExit;
-    leave();
-    callback();
-  });
+  $("ch-back").addEventListener("click", exit);
 }
 
 // Opens the editor over the finished run: an empty grid, the same stone
@@ -363,6 +497,8 @@ export function enterChallenge(hostContext) {
   showGhost = false;
   eraseMode = false;
   testing = false;
+  card.classList.remove("collapsed");
+  $("ch-collapse").textContent = "–";
   hover = null;
   $("ch-reveal").textContent = "Reveal algorithm";
   $("ch-erase").classList.remove("on");
@@ -379,7 +515,10 @@ export function enterChallenge(hostContext) {
   canvas.addEventListener("contextmenu", noMenu);
   canvas.style.cursor = "crosshair";
   canvas.style.pointerEvents = "auto";
+  // Without this a touch drag scrolls or zooms the page instead of painting.
+  canvas.style.touchAction = "none";
   card.hidden = false;
+  renderBoard();
   redraw();
   updateReadout();
 }
@@ -388,6 +527,7 @@ export function enterChallenge(hostContext) {
 export function leave() {
   if (!host) return;
   clearTimeout(solveTimer);
+  phoneLast = null;
   const { canvas } = host;
   canvas.removeEventListener("pointerdown", onDown);
   canvas.removeEventListener("pointermove", onMove);
@@ -396,6 +536,7 @@ export function leave() {
   canvas.removeEventListener("pointerleave", onLeave);
   canvas.removeEventListener("contextmenu", noMenu);
   canvas.style.cursor = "";
+  canvas.style.touchAction = "";
   card.hidden = true;
   painting = false;
   host = null;

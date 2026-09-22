@@ -108,3 +108,18 @@ export function connectionHint(status) {
   if (!status.left && !status.right) return "Neither support reaches the weight yet: there is a gap in each leg.";
   return `The ${status.left ? "right" : "left"} support isn't joined to the weight yet: there is a gap in that leg.`;
 }
+
+// The cells a bridge MUST have stone in (the corner cell above each support, and
+// at least one cell under the weight) that are still empty and lie within `reach`
+// cells of `cell`. A fingertip on a phone pad covers many grid cells and cannot
+// land on one exactly, so the editor lets a phone stroke that passes close to a
+// missing required cell fill it in (see paintFraction in challenge.js). Mouse
+// painting doesn't use this: a mouse can click the exact cell.
+export function nearbyRequiredCells(design, loadColumn, cell, reach) {
+  const status = connectionStatus(design, loadColumn);
+  const wanted = [];
+  if (!status.leftSupportStone) wanted.push(status.supportCells.left);
+  if (!status.rightSupportStone) wanted.push(status.supportCells.right);
+  if (!status.loadTouched) wanted.push(...status.underLoad);
+  return wanted.filter((c) => Math.max(Math.abs(c.elx - cell.elx), Math.abs(c.ely - cell.ely)) <= reach);
+}

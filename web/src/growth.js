@@ -7,7 +7,7 @@
 // those four steps, one at a time, each with its own picture; later
 // iterations are fast-forwarded as a quick deformed heat map, so the sag
 // visibly shrinks as the bridge stiffens.
-import { renderDensities, renderDeformed, normalizeHeat } from "./render.js";
+import { renderDensities, renderDeformed, renderStress, normalizeHeat } from "./render.js";
 import { deformScaleFor } from "./deform.js";
 import { computeElementWork } from "./sensitivity.js";
 import * as report from "./report.js";
@@ -30,7 +30,10 @@ function lerpGrid(a, b, t) {
 // iteration is the finished result at rest.
 export function showFrame(ctx, playback, index) {
   if (index > playback.frames.length) {
-    renderDensities(ctx, playback.final.densities, playback.finalWork);
+    // The result: how close each stone is to breaking at the test weight, when
+    // that has been worked out; otherwise the finished heat map.
+    if (playback.stressRatios) renderStress(ctx, playback.final.densities, playback.stressRatios);
+    else renderDensities(ctx, playback.final.densities, playback.finalWork);
     return;
   }
   const frame = playback.frames[index - 1];

@@ -23,12 +23,17 @@ import { runTopologyOptimization, iterateTopologyOptimization } from "./web/src/
 import { findConnectedPath } from "./web/src/connectivity.js";
 import { computeStrain, planeStressD, computeStress, principalStresses, maxPrincipalStress } from "./web/src/stress.js";
 import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from "./web/src/buckling.js";
-import { evaluateHalves, loadCapacityKg } from "./web/src/failure.js";
+import { evaluateHalves, loadCapacityKg, loadLimit, stressRatioMap } from "./web/src/failure.js";
 import { nodePosition, deformScaleFor } from "./web/src/deform.js";
 import { DOMAIN } from "./web/src/scene.js";
-import { createDesign, countCells, budgetCells, paintBrush, toDensities, supportsConnected, connectionStatus, connectionHint, VOID_DENSITY } from "./web/src/design.js";
+import { dispatchControlMessage, footronEnabled, spotToColumn as wallSpotToColumn, RANGES as WALL_RANGES, LESSON_IDS, BRUSH_RANGE as WALL_BRUSH, BOARD_RANGE } from "./web/src/footron.js";
+import * as phone from "./footron/controls/lib/protocol.js";
+import { LESSONS as WALL_LESSONS } from "./web/src/lessons.js";
+import { weightToSliderValue } from "./web/src/lessons.js";
+import { setupKey, encodeDesign, decodeDesign, loadBoard, addResult } from "./web/src/storage.js";
+import { createDesign, countCells, budgetCells, paintBrush, toDensities, supportsConnected, connectionStatus, connectionHint, nearbyRequiredCells, VOID_DENSITY } from "./web/src/design.js";
 import { convexHull, polygonCentroid, groupCellsBySeed, buildShards } from "./web/src/fracture.js";
-import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2, stressScaleFactor, BRIDGE_DEPTH_M } from "./web/src/units.js";
+import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2, WEIGHT_EXPONENT_MIN, WEIGHT_EXPONENT_MAX, stressScaleFactor, BRIDGE_DEPTH_M, STONE_COMPRESSIVE_STRENGTH_PA } from "./web/src/units.js";
 import { elementDofs } from "./web/src/mesh.js";
 
 const EPSILON = 1e-9;
@@ -997,6 +1002,361 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   assert.ok(status.left && !status.right, "left joined, right not");
   assert.ok(/right support/.test(connectionHint(status)), "the hint names the right support");
   console.log("\u2713 the not-connected hint names exactly what is missing");
+}
+
+// 38. The crushing check, tested on its own formula: it isn't the limiting
+// mode for any realistic design (tension or buckling always comes first), so
+// "capacity is exact" alone would never exercise it. Instead check that
+// crushingFails flips exactly at axial / (mean width * depth) = compressive
+// strength, and that loadLimit names a mode and stays consistent with it.
+{
+  const nx = 20;
+  const ny = 10;
+  const load = nx / 2;
+  const fixedDofs = [...nodeDofs(nodeId(0, 0, nx)), ...nodeDofs(nodeId(nx, 0, nx))];
+  const [, loadDof] = nodeDofs(nodeId(load, ny, nx));
+  const { densities, u } = runTopologyOptimization(nx, ny, fixedDofs, [[loadDof, -1]], { volumeFraction: 0.4 });
+  const args = { numElemX: nx, numElemY: ny, densities, u, loadColumn: load };
+
+  const reference = evaluateHalves({ ...args, testWeightKg: 1000 });
+  const half = reference.left;
+  assert.ok(Math.abs(half.crushingStressPa - half.axialForceN / half.crossSectionM2) < 1e-6 * half.crushingStressPa, "crushing stress = axial force / mean cross-section");
+
+  const crushKg = (1000 * STONE_COMPRESSIVE_STRENGTH_PA * half.crossSectionM2) / half.axialForceN;
+  const below = evaluateHalves({ ...args, testWeightKg: crushKg * 0.999 });
+  const above = evaluateHalves({ ...args, testWeightKg: crushKg * 1.001 });
+  assert.ok(!below.left.crushingFails, "just under the crushing load the strut does not crush");
+  assert.ok(above.left.crushingFails, "just over it, the strut crushes");
+
+  const limit = loadLimit(args);
+  assert.ok(["tension", "buckling", "crushing"].includes(limit.mode), `loadLimit names a mode, got ${limit.mode}`);
+  assert.ok(limit.kg <= crushKg * (1 + 1e-9), "the capacity can never exceed the crushing load");
+  console.log(`\u2713 crushing flips at exactly ${Math.round(crushKg).toLocaleString()} kg; the real limit here is ${limit.mode} at ${Math.round(limit.kg).toLocaleString()} kg`);
+}
+
+// 39. The element stiffness matrix against a first-principles derivation. The
+// earlier KE tests only check symmetry and rigid-body motion, which a wrong
+// matrix could pass. This integrates B^T D B over the unit square with 2x2
+// Gauss quadrature (plane stress, E=1, nu=0.3, thickness 1) for OUR node order
+// (bottom-left, bottom-right, top-right, top-left, y up) and requires every
+// one of the 64 entries to match.
+{
+  const E = 1;
+  const nu = 0.3;
+  const c = E / (1 - nu * nu);
+  const D = [[c, c * nu, 0], [c * nu, c, 0], [0, 0, (c * (1 - nu)) / 2]];
+  const nodes = [[0, 0], [1, 0], [1, 1], [0, 1]];
+  const g = 1 / Math.sqrt(3);
+  const gauss = [[-g, -g], [g, -g], [g, g], [-g, g]];
+  const derived = Array.from({ length: 8 }, () => new Array(8).fill(0));
+
+  for (const [xi, eta] of gauss) {
+    const dNxi = [-(1 - eta) / 4, (1 - eta) / 4, (1 + eta) / 4, -(1 + eta) / 4];
+    const dNeta = [-(1 - xi) / 4, -(1 + xi) / 4, (1 + xi) / 4, (1 - xi) / 4];
+    const J = [[0, 0], [0, 0]];
+    for (let i = 0; i < 4; i++) {
+      J[0][0] += dNxi[i] * nodes[i][0];
+      J[0][1] += dNxi[i] * nodes[i][1];
+      J[1][0] += dNeta[i] * nodes[i][0];
+      J[1][1] += dNeta[i] * nodes[i][1];
+    }
+    const det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+    const inv = [[J[1][1] / det, -J[0][1] / det], [-J[1][0] / det, J[0][0] / det]];
+    const B = Array.from({ length: 3 }, () => new Array(8).fill(0));
+    for (let i = 0; i < 4; i++) {
+      const dx = inv[0][0] * dNxi[i] + inv[0][1] * dNeta[i];
+      const dy = inv[1][0] * dNxi[i] + inv[1][1] * dNeta[i];
+      B[0][2 * i] = dx;
+      B[1][2 * i + 1] = dy;
+      B[2][2 * i] = dy;
+      B[2][2 * i + 1] = dx;
+    }
+    for (let i = 0; i < 8; i++) {
+      for (let j = 0; j < 8; j++) {
+        for (let a = 0; a < 3; a++) {
+          const DBaj = D[a].reduce((sum, d, k) => sum + d * B[k][j], 0);
+          derived[i][j] += B[a][i] * DBaj * det;
+        }
+      }
+    }
+  }
+
+  const ours = getElementStiffnessMatrix(E, nu);
+  const worst = Math.max(...ours.flatMap((row, i) => row.map((v, j) => Math.abs(v - derived[i][j]))));
+  assert.ok(worst < 1e-12, `KE must match the Gauss-integrated B^T D B, worst entry differs by ${worst}`);
+  console.log(`\u2713 the element stiffness matrix equals B^T D B integrated from first principles (worst entry off by ${worst.toExponential(1)})`);
+}
+
+// 40. Where a failure starts, and the stress map that shows it. The map is
+// the same per-cell number the strength check takes the max of, so its max
+// must equal the reported ratio exactly; a tension failure must start at the
+// map's hottest cell; and a design whose limit is buckling must start mid-strut.
+{
+  const nx = 20;
+  const ny = 10;
+  const load = nx / 2;
+  const fixedDofs = [...nodeDofs(nodeId(0, 0, nx)), ...nodeDofs(nodeId(nx, 0, nx))];
+  const [, loadDof] = nodeDofs(nodeId(load, ny, nx));
+  const { densities, u } = runTopologyOptimization(nx, ny, fixedDofs, [[loadDof, -1]], { volumeFraction: 0.4 });
+  const args = { numElemX: nx, numElemY: ny, densities, u, loadColumn: load };
+
+  const limit = loadLimit(args);
+  assert.equal(limit.mode, "tension", "this optimizer shape is limited by tension");
+
+  // Below the limit: nothing fails, so there is no origin, and the map stays under 1.
+  const safe = evaluateHalves({ ...args, testWeightKg: limit.kg * 0.5 });
+  assert.ok(safe.left.origin === null && safe.right.origin === null, "no failure, no origin");
+  const safeMax = Math.max(...stressRatioMap({ ...args, testWeightKg: limit.kg * 0.5 }).flat());
+  assert.ok(safeMax < 1, `the stress map's hottest cell is under 1 while it holds, got ${safeMax}`);
+
+  // Above it: the map's max equals the reported ratio, and the origin is that cell.
+  const weight = limit.kg * 1.5;
+  const broken = evaluateHalves({ ...args, testWeightKg: weight });
+  const map = stressRatioMap({ ...args, testWeightKg: weight });
+  const mapMax = Math.max(...map.flat());
+  const reported = Math.max(broken.left.stressRatio, broken.right.stressRatio);
+  assert.ok(Math.abs(mapMax - reported) < 1e-9 * reported, `map max ${mapMax} must equal the reported stress ratio ${reported}`);
+
+  const failing = broken[limit.side];
+  assert.ok(failing.fails && failing.origin.kind === "tension");
+  const { elx, ely } = failing.origin.cell;
+  assert.ok(Math.abs(map[ely][elx] - failing.stressRatio) < 1e-9 * failing.stressRatio, "the tension origin is the map's hottest cell in that half");
+  assert.ok(failing.cells.some((c) => c.elx === elx && c.ely === ely), "and it lies inside that half's stone");
+
+  // A one-cell-wide strut buckles long before its stone cracks: the origin is mid-strut.
+  const nx2 = 60;
+  const ny2 = 30;
+  const load2 = 30;
+  const thin = createDesign(nx2, ny2);
+  for (let y = 0; y < ny2; y++) {
+    thin[y][Math.min(load2 - 1, Math.round((y * (load2 - 1)) / (ny2 - 1)))] = 1;
+    thin[y][Math.max(load2, nx2 - 1 - Math.round((y * (nx2 - 1 - load2)) / (ny2 - 1)))] = 1;
+  }
+  const fixed2 = [...nodeDofs(nodeId(0, 0, nx2)), ...nodeDofs(nodeId(nx2, 0, nx2))];
+  const [, loadDof2] = nodeDofs(nodeId(load2, ny2, nx2));
+  const dens2 = toDensities(thin);
+  const u2 = solveDisplacement(nx2, ny2, dens2, fixed2, [[loadDof2, -1]]);
+  const args2 = { numElemX: nx2, numElemY: ny2, densities: dens2, u: u2, loadColumn: load2 };
+  const limit2 = loadLimit(args2);
+  assert.equal(limit2.mode, "buckling", "a one-cell-wide strut is limited by buckling");
+  const bent = evaluateHalves({ ...args2, testWeightKg: limit2.kg * 1.05 });
+  const bentHalf = bent[limit2.side];
+  assert.ok(bentHalf.bucklingFails && !bentHalf.strengthFails, "just past its buckling load, only buckling fails");
+  assert.equal(bentHalf.origin.kind, "buckling");
+  const mid = bentHalf.origin.cell;
+  const fraction = Math.hypot(mid.elx - bentHalf.bottomCell.elx, mid.ely - bentHalf.bottomCell.ely) / bentHalf.gridLength;
+  assert.ok(fraction > 0.3 && fraction < 0.7, `a buckling origin sits mid-strut, got ${fraction.toFixed(2)} of the way along`);
+  console.log("\u2713 failure origins: tension starts at the stress map's hottest cell, buckling starts mid-strut, and the map's max equals the reported ratio");
+}
+
+// 41. The saved-bridge board: designs round-trip exactly, each setup keeps its
+// own top 5 by capacity, identical designs are kept once, and unavailable or
+// corrupt storage never throws.
+{
+  const nx = 6;
+  const ny = 3;
+  const design = createDesign(nx, ny);
+  design[0][0] = 1;
+  design[2][5] = 1;
+  const text = encodeDesign(design);
+  assert.deepEqual(decodeDesign(text, nx, ny), design, "a design survives encode -> decode exactly");
+  assert.equal(decodeDesign(text, nx + 1, ny), null, "a design of the wrong size is rejected");
+  assert.equal(decodeDesign("01x|000|000", 3, 3), null, "a corrupt design is rejected");
+
+  const store = new Map();
+  const storage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, v) };
+  const key = setupKey(620, 30);
+  const entry = (capacityKg, cells) => ({ capacityKg, sagPct: 10, cells, when: 0 });
+
+  assert.equal(addResult(storage, key, entry(100, "a")).rank, 1, "the first result is rank 1");
+  assert.equal(addResult(storage, key, entry(300, "b")).rank, 1, "a better one takes rank 1");
+  assert.equal(addResult(storage, key, entry(200, "c")).rank, 2, "and one in between slots into rank 2");
+  assert.deepEqual(loadBoard(storage, key).map((e) => e.capacityKg), [300, 200, 100], "the board is ordered best first");
+
+  assert.equal(addResult(storage, key, entry(150, "a")).board.find((e) => e.cells === "a").capacityKg, 150, "a better score for the same design replaces it");
+  assert.equal(loadBoard(storage, key).filter((e) => e.cells === "a").length, 1, "the same design is never listed twice");
+  assert.equal(addResult(storage, key, entry(50, "a")).board.find((e) => e.cells === "a").capacityKg, 150, "a worse score for the same design changes nothing");
+
+  for (const [i, kg] of [400, 500, 600, 700].entries()) addResult(storage, key, entry(kg, `x${i}`));
+  assert.equal(loadBoard(storage, key).length, 5, "the board is capped at five");
+  assert.equal(addResult(storage, key, entry(1, "tiny")).rank, null, "a result too weak for the top five gets no rank");
+
+  assert.deepEqual(loadBoard(storage, setupKey(250, 30)), [], "another setup has its own, empty board");
+  assert.equal(addResult(storage, setupKey(250, 30), entry(Infinity, "z")).rank, null, "a non-finite capacity is never saved");
+
+  const broken = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("full"); } };
+  assert.deepEqual(loadBoard(broken, key), [], "unavailable storage reads as an empty board");
+  assert.doesNotThrow(() => addResult(broken, key, entry(100, "a")), "and writing to it never throws");
+  const garbage = { getItem: () => "{not json", setItem: () => {} };
+  assert.deepEqual(loadBoard(garbage, key), [], "corrupt saved data reads as an empty board");
+  console.log("\u2713 the saved-bridge board ranks per setup, dedupes, caps at five, and survives bad storage");
+}
+
+// 42. The phone -> wall protocol: every message type reaches its handler with
+// clamped values, and anything malformed is ignored without touching state.
+{
+  const calls = [];
+  const record = (name) => (...args) => calls.push([name, ...args]);
+  const handlers = {
+    onActivity: record("activity"),
+    onSetup: record("setup"), onGrow: record("grow"), onLesson: record("lesson"), onSkip: record("skip"),
+    onScrub: record("scrub"), onReplay: record("replay"), onTest: record("test"), onYourTurn: record("yourTurn"),
+    onPaint: record("paint"), onStrokeEnd: record("strokeEnd"), onBrush: record("brush"), onClear: record("clear"),
+    onReveal: record("reveal"), onTestMine: record("testMine"), onSave: record("save"), onLoadBest: record("loadBest"),
+  };
+  const send = (body) => {
+    calls.length = 0;
+    return dispatchControlMessage(body, handlers);
+  };
+
+  // Accepted messages: handled, with activity noted first, values clamped.
+  assert.ok(send({ type: "setup", key: "stone", value: 9999 }));
+  assert.deepEqual(calls, [["activity"], ["setup", "stone", WALL_RANGES.stone[1]]], "stone is clamped to its range");
+  send({ type: "setup", key: "weight", value: -3 });
+  assert.deepEqual(calls[1], ["setup", "weight", 0], "weight is clamped at 0");
+  send({ type: "setup", key: "spot", value: 0.4 });
+  assert.deepEqual(calls[1], ["setup", "spot", 0.4]);
+  send({ type: "paint", x: 1.7, y: -0.2, erase: true });
+  assert.deepEqual(calls[1], ["paint", 1, 0, true], "paint coordinates are clamped to the design area");
+  send({ type: "paint", x: 0.5, y: 0.5 });
+  assert.deepEqual(calls[1], ["paint", 0.5, 0.5, false], "erase defaults to false");
+  send({ type: "brush", value: 7.6 });
+  assert.deepEqual(calls[1], ["brush", 4], "brush is rounded and clamped");
+  send({ type: "grow" });
+  assert.deepEqual(calls[1], ["grow", {}], "a bare grow carries no setup");
+  send({ type: "grow", stone: 400, weight: 2, spot: "middle" });
+  assert.deepEqual(calls[1], ["grow", { stone: 400, weight: 1 }], "grow applies the finite setup fields, clamped, and ignores the rest");
+  send({ type: "loadBest", value: 0 });
+  assert.deepEqual(calls[1], ["loadBest", 1], "the board rank is clamped to 1..5");
+  send({ type: "scrub", value: 0.25 });
+  assert.deepEqual(calls[1], ["scrub", 0.25]);
+  for (const [body, name] of [[{ type: "grow" }, "grow"], [{ type: "skip" }, "skip"], [{ type: "replay" }, "replay"], [{ type: "test" }, "test"],
+    [{ type: "clear" }, "clear"], [{ type: "testMine" }, "testMine"], [{ type: "save" }, "save"], [{ type: "stroke", value: "end" }, "strokeEnd"]]) {
+    assert.ok(send(body), `${body.type} is accepted`);
+    assert.equal(calls[1][0], name);
+  }
+  send({ type: "yourTurn", value: true });
+  assert.deepEqual(calls[1], ["yourTurn", true]);
+  send({ type: "reveal", value: false });
+  assert.deepEqual(calls[1], ["reveal", false]);
+  send({ type: "lesson", value: "spot" });
+  assert.deepEqual(calls[1], ["lesson", "spot"]);
+
+  // Malformed or unknown messages do nothing at all: no handler, not even activity.
+  for (const bad of [
+    null, undefined, "grow", 7, [], {}, { type: "nope" },
+    { type: "setup", key: "stone", value: "620" }, { type: "setup", key: "bogus", value: 1 }, { type: "setup", key: "stone", value: NaN },
+    { type: "lesson", value: "not-a-lesson" }, { type: "yourTurn", value: "yes" }, { type: "reveal" },
+    { type: "paint", x: "0.5", y: 0.5 }, { type: "paint", x: 0.5 }, { type: "stroke", value: "start" }, { type: "brush", value: Infinity },
+  ]) {
+    assert.equal(send(bad), false, `ignored: ${JSON.stringify(bad)}`);
+    assert.deepEqual(calls, [], `no handler ran for ${JSON.stringify(bad)}`);
+  }
+
+  assert.ok(footronEnabled("?ftMsgUrl=ws%3A%2F%2Fx"), "the wall passes ?ftMsgUrl");
+  assert.ok(footronEnabled("?ftmsg=1"), "?ftmsg=1 forces messaging on for local testing");
+  assert.ok(!footronEnabled(""), "off the wall, messaging stays off");
+  console.log("\u2713 the phone -> wall protocol clamps values, routes every message, and ignores anything malformed");
+}
+
+// 43. The phone and the wall agree. The phone's protocol module is imported
+// here and checked against the wall's: same ranges, same lessons (ids AND
+// titles), same spot-to-column rule, same weight scale, and every message the
+// phone can build is accepted by the wall's dispatcher.
+{
+  assert.deepEqual(phone.RANGES, WALL_RANGES, "the phone's slider ranges equal the wall's clamps");
+  assert.deepEqual(phone.LESSONS.map((l) => l.id), LESSON_IDS, "the phone offers exactly the lessons the wall accepts");
+  assert.deepEqual(phone.LESSONS.map((l) => l.id), WALL_LESSONS.map((l) => l.id), "and in the wall's order");
+  assert.deepEqual(phone.LESSONS.map((l) => l.label), WALL_LESSONS.map((l) => l.title), "with the same titles");
+  assert.deepEqual(phone.BRUSH_RANGE, WALL_BRUSH, "the same brush range");
+  assert.equal(phone.BOARD_SIZE, BOARD_RANGE[1], "the phone's board size is the wall's largest rank");
+
+  for (const f of [0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.97, 1]) {
+    assert.equal(phone.spotToColumn(f, 60), wallSpotToColumn(f, 60), `spot ${f} lands in the same column on both ends`);
+  }
+  assert.ok(wallSpotToColumn(0, 60) >= 3 && wallSpotToColumn(1, 60) <= 57, "a spot never lands on a support");
+
+  // The phone's weight scale must invert the wall's slider mapping.
+  const [lo, hi] = phone.WEIGHT_EXPONENTS;
+  assert.deepEqual([lo, hi], [WEIGHT_EXPONENT_MIN, WEIGHT_EXPONENT_MAX], "the phone's log scale is the wall's");
+  for (const kg of [1000, 30000, 100000, 1000000]) {
+    const slider = weightToSliderValue(kg, lo, hi, 1000);
+    assert.ok(Math.abs(phone.weightKg(slider / 1000) - kg) / kg < 0.01, `the weight slider maps ${kg} kg back to within 1%`);
+  }
+
+  // Every message the phone can build is one the wall accepts.
+  const seen = [];
+  const accept = new Proxy({}, { get: (_, name) => (...args) => seen.push(name) });
+  // Each lesson on the phone must carry the setup the wall really uses for it, or
+  // tapping a lesson would move the phone's sliders somewhere the wall isn't.
+  for (const wall of WALL_LESSONS) {
+    const mirror = phone.LESSONS.find((l) => l.id === wall.id);
+    assert.equal(mirror.material, wall.material, `lesson ${wall.id}: same stone on both ends`);
+    assert.equal(mirror.column, wall.column, `lesson ${wall.id}: same column on both ends`);
+    const wallKg = Math.round(10 ** (lo + ((hi - lo) * weightToSliderValue(wall.weightKg, lo, hi, 1000)) / 1000));
+    assert.ok(Math.abs(phone.weightKg(phone.weightFraction(mirror.weightKg)) - wallKg) / wallKg < 0.01, `lesson ${wall.id}: the phone's weight slider lands on the wall's weight`);
+    assert.equal(wallSpotToColumn(mirror.column / 60, 60), mirror.column, `lesson ${wall.id}: its column survives the spot conversion, so the pad arrow is right`);
+  }
+
+  for (const [name, build] of Object.entries(phone.msg)) {
+    const sample = { setup: [phone.msg.setup("stone", 620)], grow: [{ stone: 620, weight: 0.6, spot: 0.5 }], lesson: ["meet"], scrub: [0.5], yourTurn: [true], paint: [0.5, 0.5, false], brush: [2], reveal: [true], loadBest: [1] }[name];
+    const message = sample ? (name === "setup" ? sample[0] : build(...sample)) : build();
+    assert.ok(dispatchControlMessage(message, { onActivity() {}, ...Object.fromEntries(["Setup","Grow","Lesson","Skip","Scrub","Replay","Test","YourTurn","Paint","StrokeEnd","Brush","Clear","Reveal","TestMine","Save","LoadBest"].map((n) => [`on${n}`, () => {}])) }), `the wall accepts the phone's "${name}" message`);
+  }
+  console.log("\u2713 the phone and the wall agree: ranges, lessons, spot rule, weight scale, and every message the phone builds");
+}
+
+// 44. Finger assist: a stroke passing near a required, still-empty cell (a
+// support's corner cell, or the top under the weight) reports it; nothing
+// reports once it is filled, and a stroke far from everything reports nothing.
+{
+  const nx = 60;
+  const ny = 30;
+  const load = 30;
+  const design = createDesign(nx, ny);
+  const at = (elx, ely, reach = 3) => nearbyRequiredCells(design, load, { elx, ely }, reach).map((c) => `${c.elx},${c.ely}`).sort();
+
+  assert.deepEqual(at(2, 2), ["0,0"], "near the left corner, only the left corner cell is offered");
+  assert.deepEqual(at(57, 1), ["59,0"], "near the right corner, only the right corner cell");
+  assert.deepEqual(at(31, 27), ["29,29", "30,29"].sort(), "near the top under the weight, both cells under it");
+  assert.deepEqual(at(30, 15), [], "in the middle of nowhere, nothing");
+  assert.deepEqual(at(5, 5), [], "four cells from the corner is out of reach (reach 3)");
+
+  design[0][0] = 1;
+  assert.deepEqual(at(2, 2), [], "once the corner cell has stone, it is no longer offered");
+  design[29][30] = 1;
+  assert.deepEqual(at(31, 27), [], "once one cell under the weight has stone, none is offered");
+  console.log("\u2713 finger assist offers exactly the missing required cells within reach");
+}
+
+// 45. Finger assist must actually CONNECT the required cell to the stroke, not
+// just paint it in isolation -- a design can have stone in the corner cell and
+// still fail supportsConnected if that cell isn't reachable from the rest of
+// the bridge. This is the scenario challenge.js's paintFraction hits: a stroke
+// lands a few cells from a support corner and the assist bridges the gap.
+{
+  const nx = 60;
+  const ny = 30;
+  const load = 30;
+  const design = createDesign(nx, ny);
+
+  // Simulate what paintFraction does for one point of a stroke near the left
+  // corner: paint the stroke's own cell, then connect any nearby required cell
+  // to THAT cell with a line (mirroring the fix, not just paintAt on its own).
+  const strokeCell = { elx: 2, ely: 2 };
+  paintBrush(design, strokeCell.elx, strokeCell.ely, 1, false, 1000);
+  for (const required of nearbyRequiredCells(design, load, strokeCell, 4)) {
+    const steps = Math.max(Math.abs(required.elx - strokeCell.elx), Math.abs(required.ely - strokeCell.ely), 1);
+    for (let i = 0; i <= steps; i++) {
+      paintBrush(design, Math.round(strokeCell.elx + ((required.elx - strokeCell.elx) * i) / steps), Math.round(strokeCell.ely + ((required.ely - strokeCell.ely) * i) / steps), 1, false, 1000);
+    }
+  }
+  assert.equal(design[0][0], 1, "the corner cell itself got stone");
+  const status = connectionStatus(design, load);
+  assert.ok(status.leftSupportStone, "the corner reads as having stone");
+  const path = findConnectedPath(design, 0.5, { elx: 0, ely: 0 }, strokeCell);
+  assert.ok(path !== null, "and it must be 8-connected to the stroke, not just sitting there isolated");
+  console.log("\u2713 finger assist connects the required cell to the stroke, not just marks it");
 }
 
 console.log("\nAll checks passed.");

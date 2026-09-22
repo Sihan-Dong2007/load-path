@@ -1,0 +1,13 @@
+{
+  "name": "load-path-dev-tools",
+  "private": true,
+  "description": "Only for smoke-testing the phone UI in footron/controls locally. Nothing here ships.",
+  "scripts": { "build-phone": "node build-phone.mjs" },
+  "dependencies": {
+    "@emotion/react": "^11.11.0",
+    "@material-ui/core": "^4.12.4",
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2"
+  },
+  "devDependencies": { "esbuild": "^0.21.0" }
+}
