@@ -26,7 +26,7 @@ import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from 
 import { evaluateHalves, loadCapacityKg, loadLimit, stressRatioMap } from "./web/src/failure.js";
 import { nodePosition, deformScaleFor } from "./web/src/deform.js";
 import { DOMAIN } from "./web/src/scene.js";
-import { dispatchControlMessage, footronEnabled, spotToColumn as wallSpotToColumn, RANGES as WALL_RANGES, LESSON_IDS, BRUSH_RANGE as WALL_BRUSH, BOARD_RANGE } from "./web/src/footron.js";
+import { dispatchControlMessage, footronEnabled, spotToColumn as wallSpotToColumn, RANGES as WALL_RANGES, LESSON_IDS, BRUSH_RANGE as WALL_BRUSH, BOARD_RANGE, connectFootron } from "./web/src/footron.js";
 import * as phone from "./controls/lib/protocol.js";
 import { LESSONS as WALL_LESSONS } from "./web/src/lessons.js";
 import { weightToSliderValue } from "./web/src/lessons.js";
@@ -1203,6 +1203,7 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
     onScrub: record("scrub"), onReplay: record("replay"), onTest: record("test"), onYourTurn: record("yourTurn"),
     onPaint: record("paint"), onStrokeEnd: record("strokeEnd"), onBrush: record("brush"), onClear: record("clear"),
     onReveal: record("reveal"), onTestMine: record("testMine"), onSave: record("save"), onLoadBest: record("loadBest"),
+    onHello: record("hello"),
   };
   const send = (body) => {
     calls.length = 0;
@@ -1237,6 +1238,9 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   }
   send({ type: "yourTurn", value: true });
   assert.deepEqual(calls[1], ["yourTurn", true]);
+  // A phone merely opening asks for the state; that is not activity, or it would end the unattended loop.
+  assert.ok(send({ type: "hello" }));
+  assert.deepEqual(calls, [["hello"]], "hello reaches its handler without counting as activity");
   send({ type: "reveal", value: false });
   assert.deepEqual(calls[1], ["reveal", false]);
   send({ type: "lesson", value: "spot" });
@@ -1301,7 +1305,7 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   for (const [name, build] of Object.entries(phone.msg)) {
     const sample = { setup: [phone.msg.setup("stone", 620)], grow: [{ stone: 620, weight: 0.6, spot: 0.5 }], lesson: ["meet"], scrub: [0.5], yourTurn: [true], paint: [0.5, 0.5, false], brush: [2], reveal: [true], loadBest: [1] }[name];
     const message = sample ? (name === "setup" ? sample[0] : build(...sample)) : build();
-    assert.ok(dispatchControlMessage(message, { onActivity() {}, ...Object.fromEntries(["Setup","Grow","Lesson","Skip","Scrub","Replay","Test","YourTurn","Paint","StrokeEnd","Brush","Clear","Reveal","TestMine","Save","LoadBest"].map((n) => [`on${n}`, () => {}])) }), `the wall accepts the phone's "${name}" message`);
+    assert.ok(dispatchControlMessage(message, { onActivity() {}, ...Object.fromEntries(["Setup","Grow","Lesson","Skip","Scrub","Replay","Test","YourTurn","Paint","StrokeEnd","Brush","Clear","Reveal","TestMine","Save","LoadBest","Hello"].map((n) => [`on${n}`, () => {}])) }), `the wall accepts the phone's "${name}" message`);
   }
   console.log("\u2713 the phone and the wall agree: ranges, lessons, spot rule, weight scale, and every message the phone builds");
 }
@@ -1357,6 +1361,43 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   const path = findConnectedPath(design, 0.5, { elx: 0, ely: 0 }, strokeCell);
   assert.ok(path !== null, "and it must be 8-connected to the stroke, not just sitting there isolated");
   console.log("\u2713 finger assist connects the required cell to the stroke, not just marks it");
+}
+
+// 46. The wall can talk back to the phone (the state report that greys out "Open
+// the editor" until a bridge has grown), and that must be safe everywhere: a
+// no-op off the wall, and a send with nobody listening must not throw.
+{
+  const off = connectFootron({}, { enabled: false });
+  assert.doesNotThrow(() => off.send({ type: "state", canEdit: false }), "off the wall, send is a no-op");
+  assert.doesNotThrow(() => off.close(), "and so is close");
+
+  const previous = globalThis.FootronMessaging;
+  const sent = [];
+  let failing = false;
+  globalThis.FootronMessaging = {
+    Messaging: class {
+      addMessageListener() {}
+      removeMessageListener() {}
+      mount() {}
+      unmount() {}
+      sendMessage(message) {
+        if (failing) return Promise.reject(new Error("no phone connected"));
+        sent.push(message);
+        return Promise.resolve();
+      }
+    },
+  };
+  try {
+    const link = connectFootron({}, { enabled: true });
+    link.send({ type: "state", canEdit: true });
+    assert.deepEqual(sent, [{ type: "state", canEdit: true }], "the state report reaches the messaging client as given");
+    failing = true;
+    assert.doesNotThrow(() => link.send({ type: "state", canEdit: false }), "a rejected send (no phone yet) is swallowed");
+    link.close();
+  } finally {
+    globalThis.FootronMessaging = previous;
+  }
+  console.log("\u2713 the wall can report state to the phone, and doing so is safe with no phone or off the wall");
 }
 
 console.log("\nAll checks passed.");
