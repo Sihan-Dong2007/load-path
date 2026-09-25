@@ -26,7 +26,7 @@
 </section>
 <section>
   <button id="turn">Your turn</button><button id="back">Back</button><button id="clear">Clear</button><button id="reveal">Reveal</button>
-  <button id="mine">Test mine</button><button id="save">Save</button><button id="best1">Load best #1</button>
+  <button id="mine">Test mine</button>
   <label>Brush <span id="brushV">1</span></label><input id="brush" type="range" min="0" max="4" step="1" value="1">
   <label><input id="erase" type="checkbox"> erase</label>
   <canvas id="pad" width="600" height="300"></canvas>
@@ -53,8 +53,6 @@
   let revealed = false;
   $("reveal").onclick = () => { revealed = !revealed; send({ type: "reveal", value: revealed }); };
   $("mine").onclick = () => send({ type: "testMine" });
-  $("save").onclick = () => send({ type: "save" });
-  $("best1").onclick = () => send({ type: "loadBest", value: 1 });
   $("brush").oninput = (e) => { $("brushV").textContent = e.target.value; send({ type: "brush", value: Number(e.target.value) }); };
   const pad = $("pad");
   const at = (e) => { const r = pad.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; };

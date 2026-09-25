@@ -26,11 +26,10 @@ import { rectMomentOfInertia, eulerCriticalLoad, resolveTrussAxialForces } from 
 import { evaluateHalves, loadCapacityKg, loadLimit, stressRatioMap } from "./web/src/failure.js";
 import { nodePosition, deformScaleFor } from "./web/src/deform.js";
 import { DOMAIN } from "./web/src/scene.js";
-import { dispatchControlMessage, footronEnabled, spotToColumn as wallSpotToColumn, RANGES as WALL_RANGES, LESSON_IDS, BRUSH_RANGE as WALL_BRUSH, BOARD_RANGE, connectFootron } from "./web/src/footron.js";
+import { dispatchControlMessage, footronEnabled, spotToColumn as wallSpotToColumn, RANGES as WALL_RANGES, LESSON_IDS, BRUSH_RANGE as WALL_BRUSH, connectFootron } from "./web/src/footron.js";
 import * as phone from "./controls/lib/protocol.js";
 import { LESSONS as WALL_LESSONS } from "./web/src/lessons.js";
 import { weightToSliderValue } from "./web/src/lessons.js";
-import { setupKey, encodeDesign, decodeDesign, loadBoard, addResult } from "./web/src/storage.js";
 import { createDesign, countCells, budgetCells, paintBrush, toDensities, supportsConnected, connectionStatus, connectionHint, nearbyRequiredCells, VOID_DENSITY } from "./web/src/design.js";
 import { convexHull, polygonCentroid, groupCellsBySeed, buildShards } from "./web/src/fracture.js";
 import { kgToVolumeFraction, volumeFractionToKg, MAX_MATERIAL_KG, kgToNewtons, GRAVITY_M_S2, WEIGHT_EXPONENT_MIN, WEIGHT_EXPONENT_MAX, stressScaleFactor, BRIDGE_DEPTH_M, STONE_COMPRESSIVE_STRENGTH_PA } from "./web/src/units.js";
@@ -1149,49 +1148,6 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   console.log("\u2713 failure origins: tension starts at the stress map's hottest cell, buckling starts mid-strut, and the map's max equals the reported ratio");
 }
 
-// 41. The saved-bridge board: designs round-trip exactly, each setup keeps its
-// own top 5 by capacity, identical designs are kept once, and unavailable or
-// corrupt storage never throws.
-{
-  const nx = 6;
-  const ny = 3;
-  const design = createDesign(nx, ny);
-  design[0][0] = 1;
-  design[2][5] = 1;
-  const text = encodeDesign(design);
-  assert.deepEqual(decodeDesign(text, nx, ny), design, "a design survives encode -> decode exactly");
-  assert.equal(decodeDesign(text, nx + 1, ny), null, "a design of the wrong size is rejected");
-  assert.equal(decodeDesign("01x|000|000", 3, 3), null, "a corrupt design is rejected");
-
-  const store = new Map();
-  const storage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, v) };
-  const key = setupKey(620, 30);
-  const entry = (capacityKg, cells) => ({ capacityKg, sagPct: 10, cells, when: 0 });
-
-  assert.equal(addResult(storage, key, entry(100, "a")).rank, 1, "the first result is rank 1");
-  assert.equal(addResult(storage, key, entry(300, "b")).rank, 1, "a better one takes rank 1");
-  assert.equal(addResult(storage, key, entry(200, "c")).rank, 2, "and one in between slots into rank 2");
-  assert.deepEqual(loadBoard(storage, key).map((e) => e.capacityKg), [300, 200, 100], "the board is ordered best first");
-
-  assert.equal(addResult(storage, key, entry(150, "a")).board.find((e) => e.cells === "a").capacityKg, 150, "a better score for the same design replaces it");
-  assert.equal(loadBoard(storage, key).filter((e) => e.cells === "a").length, 1, "the same design is never listed twice");
-  assert.equal(addResult(storage, key, entry(50, "a")).board.find((e) => e.cells === "a").capacityKg, 150, "a worse score for the same design changes nothing");
-
-  for (const [i, kg] of [400, 500, 600, 700].entries()) addResult(storage, key, entry(kg, `x${i}`));
-  assert.equal(loadBoard(storage, key).length, 5, "the board is capped at five");
-  assert.equal(addResult(storage, key, entry(1, "tiny")).rank, null, "a result too weak for the top five gets no rank");
-
-  assert.deepEqual(loadBoard(storage, setupKey(250, 30)), [], "another setup has its own, empty board");
-  assert.equal(addResult(storage, setupKey(250, 30), entry(Infinity, "z")).rank, null, "a non-finite capacity is never saved");
-
-  const broken = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("full"); } };
-  assert.deepEqual(loadBoard(broken, key), [], "unavailable storage reads as an empty board");
-  assert.doesNotThrow(() => addResult(broken, key, entry(100, "a")), "and writing to it never throws");
-  const garbage = { getItem: () => "{not json", setItem: () => {} };
-  assert.deepEqual(loadBoard(garbage, key), [], "corrupt saved data reads as an empty board");
-  console.log("\u2713 the saved-bridge board ranks per setup, dedupes, caps at five, and survives bad storage");
-}
-
 // 42. The phone -> wall protocol: every message type reaches its handler with
 // clamped values, and anything malformed is ignored without touching state.
 {
@@ -1202,7 +1158,7 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
     onSetup: record("setup"), onGrow: record("grow"), onLesson: record("lesson"), onSkip: record("skip"),
     onScrub: record("scrub"), onReplay: record("replay"), onTest: record("test"), onYourTurn: record("yourTurn"),
     onPaint: record("paint"), onStrokeEnd: record("strokeEnd"), onBrush: record("brush"), onClear: record("clear"),
-    onReveal: record("reveal"), onTestMine: record("testMine"), onSave: record("save"), onLoadBest: record("loadBest"),
+    onReveal: record("reveal"), onTestMine: record("testMine"),
     onHello: record("hello"),
   };
   const send = (body) => {
@@ -1227,12 +1183,10 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   assert.deepEqual(calls[1], ["grow", {}], "a bare grow carries no setup");
   send({ type: "grow", stone: 400, weight: 2, spot: "middle" });
   assert.deepEqual(calls[1], ["grow", { stone: 400, weight: 1 }], "grow applies the finite setup fields, clamped, and ignores the rest");
-  send({ type: "loadBest", value: 0 });
-  assert.deepEqual(calls[1], ["loadBest", 1], "the board rank is clamped to 1..5");
   send({ type: "scrub", value: 0.25 });
   assert.deepEqual(calls[1], ["scrub", 0.25]);
   for (const [body, name] of [[{ type: "grow" }, "grow"], [{ type: "skip" }, "skip"], [{ type: "replay" }, "replay"], [{ type: "test" }, "test"],
-    [{ type: "clear" }, "clear"], [{ type: "testMine" }, "testMine"], [{ type: "save" }, "save"], [{ type: "stroke", value: "end" }, "strokeEnd"]]) {
+    [{ type: "clear" }, "clear"], [{ type: "testMine" }, "testMine"], [{ type: "stroke", value: "end" }, "strokeEnd"]]) {
     assert.ok(send(body), `${body.type} is accepted`);
     assert.equal(calls[1][0], name);
   }
@@ -1273,7 +1227,6 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   assert.deepEqual(phone.LESSONS.map((l) => l.id), WALL_LESSONS.map((l) => l.id), "and in the wall's order");
   assert.deepEqual(phone.LESSONS.map((l) => l.label), WALL_LESSONS.map((l) => l.title), "with the same titles");
   assert.deepEqual(phone.BRUSH_RANGE, WALL_BRUSH, "the same brush range");
-  assert.equal(phone.BOARD_SIZE, BOARD_RANGE[1], "the phone's board size is the wall's largest rank");
 
   for (const f of [0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.97, 1]) {
     assert.equal(phone.spotToColumn(f, 60), wallSpotToColumn(f, 60), `spot ${f} lands in the same column on both ends`);
@@ -1303,9 +1256,9 @@ console.log("✓ sparse assembly passes the same rigid-body check as dense");
   }
 
   for (const [name, build] of Object.entries(phone.msg)) {
-    const sample = { setup: [phone.msg.setup("stone", 620)], grow: [{ stone: 620, weight: 0.6, spot: 0.5 }], lesson: ["meet"], scrub: [0.5], yourTurn: [true], paint: [0.5, 0.5, false], brush: [2], reveal: [true], loadBest: [1] }[name];
+    const sample = { setup: [phone.msg.setup("stone", 620)], grow: [{ stone: 620, weight: 0.6, spot: 0.5 }], lesson: ["meet"], scrub: [0.5], yourTurn: [true], paint: [0.5, 0.5, false], brush: [2], reveal: [true] }[name];
     const message = sample ? (name === "setup" ? sample[0] : build(...sample)) : build();
-    assert.ok(dispatchControlMessage(message, { onActivity() {}, ...Object.fromEntries(["Setup","Grow","Lesson","Skip","Scrub","Replay","Test","YourTurn","Paint","StrokeEnd","Brush","Clear","Reveal","TestMine","Save","LoadBest","Hello"].map((n) => [`on${n}`, () => {}])) }), `the wall accepts the phone's "${name}" message`);
+    assert.ok(dispatchControlMessage(message, { onActivity() {}, ...Object.fromEntries(["Setup","Grow","Lesson","Skip","Scrub","Replay","Test","YourTurn","Paint","StrokeEnd","Brush","Clear","Reveal","TestMine","Hello"].map((n) => [`on${n}`, () => {}])) }), `the wall accepts the phone's "${name}" message`);
   }
   console.log("\u2713 the phone and the wall agree: ranges, lessons, spot rule, weight scale, and every message the phone builds");
 }
